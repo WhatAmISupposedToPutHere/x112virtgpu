@@ -1,0 +1,652 @@
+use std::{fs, mem, ptr, slice, thread};
+use std::cell::{RefCell};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{IoSlice, IoSliceMut};
+use std::num::NonZeroUsize;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::ptr::{NonNull};
+use std::rc::Rc;
+use std::time::Duration;
+use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr};
+use nix::libc::{c_int, off_t, c_void, O_RDWR};
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use anyhow::Result;
+use nix::errno::Errno;
+use nix::fcntl::AtFlags;
+use nix::unistd::{linkat, read, unlink};
+use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, RecvMsg, sendmsg};
+
+const PAGE_SIZE: usize = 4096;
+
+const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
+const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
+const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
+const CAPSET_CROSS_DOMAIN: u64 = 5;
+const CROSS_DOMAIN_CHANNEL_RING: u32 = 1;
+const VIRTGPU_BLOB_MEM_GUEST: u32 = 0x0001;
+const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
+const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+const VIRTGPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
+const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x90000000;
+const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
+const CROSS_DOMAIN_ID_TYPE_SHM: u32 = 5;
+
+const X11_OPCODE_QUERY_EXTENSION: u8 = 98;
+const X11_OPCODE_NOP: u8 = 127;
+const X11_REPLY: u8 = 1;
+const DRI3_OPCODE_OPEN: u8 = 1;
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuContextInit {
+    num_params: u32,
+    pad: u32,
+    ctx_set_params: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuContextSetParam {
+    param: u64,
+    value: u64,
+}
+
+ioctl_readwrite!(drm_virtgpu_context_init, 'd', 0x40 + 0xb, DrmVirtgpuContextInit);
+
+#[repr(C)]
+#[derive(Default)]
+        struct DrmVirtgpuResourceCreateBlob {
+    blob_mem: u32,
+    blob_flags: u32,
+    bo_handle: u32,
+    res_handle: u32,
+    size: u64,
+    pad: u32,
+    cmd_size: u32,
+    cmd: u64,
+    blob_id: u64
+}
+
+ioctl_readwrite!(drm_virtgpu_resource_create_blob, 'd', 0x40 + 0xa, DrmVirtgpuResourceCreateBlob);
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuMap {
+    offset: u64,
+    handle: u32,
+    pad: u32
+}
+
+ioctl_readwrite!(drm_virtgpu_map, 'd', 0x40 + 0x1, DrmVirtgpuMap);
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmGemClose {
+    handle: u32,
+    pad: u32
+}
+
+impl DrmGemClose {
+    fn new(handle: u32) -> DrmGemClose {
+        DrmGemClose {
+            handle,
+            ..DrmGemClose::default()
+        }
+    }
+}
+
+ioctl_write_ptr!(drm_gem_close, 'd', 0x9, DrmGemClose);
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmPrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32
+}
+
+ioctl_readwrite!(drm_prime_handle_to_fd, 'd', 0x2d, DrmPrimeHandle);
+ioctl_readwrite!(drm_prime_fd_to_handle, 'd', 0x2e, DrmPrimeHandle);
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmEvent {
+    ty: u32,
+    length: u32
+}
+
+const VIRTGPU_EXECBUF_RING_IDX: u32 = 0x04;
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuExecbuffer {
+    flags: u32,
+    size: u32,
+    command: u64,
+    bo_handles: u64,
+    num_bo_handles: u32,
+    fence_fd: i32,
+    ring_idx: u32,
+    pad: u32
+}
+
+ioctl_readwrite!(drm_virtgpu_execbuffer, 'd', 0x40 + 0x2, DrmVirtgpuExecbuffer);
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuResourceInfo {
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    blob_mem: u32
+}
+
+ioctl_readwrite!(drm_virtgpu_resource_info, 'd', 0x40 + 0x5, DrmVirtgpuResourceInfo);
+
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainHeader {
+    cmd: u8,
+    fence_ctx_idx: u8,
+    cmd_size: u16,
+    pad: u32
+}
+
+impl CrossDomainHeader {
+    fn new(cmd: u8, cmd_size: u16) -> CrossDomainHeader {
+        CrossDomainHeader {
+            cmd, cmd_size,
+            ..CrossDomainHeader::default()
+        }
+    }
+}
+
+const CROSS_DOMAIN_CMD_INIT: u8 = 1;
+const CROSS_DOMAIN_CMD_POLL: u8 = 3;
+const CROSS_DOMAIN_CHANNEL_TYPE_X11: u32 = 0x11;
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainInit {
+    hdr: CrossDomainHeader,
+    query_ring_id: u32,
+    channel_ring_id: u32,
+    channel_type: u32
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainPoll {
+    hdr: CrossDomainHeader,
+    pad: u64
+}
+
+impl CrossDomainPoll {
+    fn new() -> CrossDomainPoll {
+        CrossDomainPoll {
+            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_POLL, mem::size_of::<CrossDomainPoll>() as u16),
+            ..CrossDomainPoll::default()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct CrossDomainFutexNew {
+    hdr: CrossDomainHeader,
+    filename: u64,
+    id: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct CrossDomainFutexSignal {
+    hdr: CrossDomainHeader,
+    id: u32,
+    pad: u32,
+}
+
+const CROSS_DOMAIN_MAX_IDENTIFIERS: usize = 4;
+const CROSS_DOMAIN_CMD_SEND: u8 = 4;
+const CROSS_DOMAIN_CMD_RECEIVE: u8 = 5;
+const CROSS_DOMAIN_CMD_FUTEX_NEW: u8 = 8;
+const CROSS_DOMAIN_CMD_FUTEX_SIGNAL: u8 = 9;
+
+#[repr(C)]
+struct CrossDomainSendReceive<T: ?Sized> {
+    hdr: CrossDomainHeader,
+    num_identifiers: u32,
+    opaque_data_size: u32,
+    identifiers: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
+    identifier_types: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
+    identifier_sizes: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
+    data: T
+}
+
+const CROSS_DOMAIN_SR_TAIL_SIZE: usize = PAGE_SIZE - mem::size_of::<CrossDomainSendReceive<()>>();
+
+struct GpuRing {
+    handle: u32,
+    res_id: u32,
+    address: *mut c_void,
+    fd: OwnedFd,
+}
+
+impl GpuRing {
+    fn new(fd: &OwnedFd) -> Result<GpuRing> {
+        let fd = fd.try_clone().unwrap();
+        let mut create_blob = DrmVirtgpuResourceCreateBlob {
+            size: PAGE_SIZE as u64,
+            blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+            blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+            ..DrmVirtgpuResourceCreateBlob::default()
+        };
+        unsafe {
+            drm_virtgpu_resource_create_blob(fd.as_raw_fd() as c_int, &mut create_blob)?;
+        }
+        let mut map = DrmVirtgpuMap {
+            handle: create_blob.bo_handle,
+            ..DrmVirtgpuMap::default()
+        };
+        unsafe {
+            drm_virtgpu_map(fd.as_raw_fd() as c_int, &mut map)?;
+        }
+        let ptr = unsafe {
+            mmap(
+                None, NonZeroUsize::new(PAGE_SIZE).unwrap(),
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED, &fd, map.offset as off_t
+            )?.as_ptr()
+        };
+        Ok(GpuRing {
+            fd,
+            handle: create_blob.bo_handle,
+            res_id: create_blob.res_handle,
+            address: ptr
+        })
+    }
+}
+
+impl Drop for GpuRing {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(NonNull::new(self.address).unwrap(), PAGE_SIZE).unwrap();
+            let close = DrmGemClose::new(self.handle);
+            drm_gem_close(self.fd.as_raw_fd() as c_int, &close).unwrap();
+        }
+    }
+}
+
+struct Context {
+    fd: OwnedFd,
+    channel_ring: GpuRing,
+    query_ring: GpuRing
+}
+
+impl Context {
+    fn new() -> Result<Context> {
+        let mut params = [
+            DrmVirtgpuContextSetParam {
+                param: VIRTGPU_CONTEXT_PARAM_CAPSET_ID,
+                value: CAPSET_CROSS_DOMAIN
+            },
+            DrmVirtgpuContextSetParam {
+                param: VIRTGPU_CONTEXT_PARAM_NUM_RINGS,
+                value: 2
+            },
+            DrmVirtgpuContextSetParam {
+                param: VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK,
+                value: 1 << CROSS_DOMAIN_CHANNEL_RING
+            }
+        ];
+        let mut init = DrmVirtgpuContextInit {
+            num_params: 3,
+            pad: 0,
+            ctx_set_params: params.as_mut_ptr() as u64
+        };
+        let fd: OwnedFd = File::options().write(true).read(true).open("/dev/dri/renderD128")?.into();
+        unsafe {
+            drm_virtgpu_context_init(fd.as_raw_fd() as c_int, &mut init)?;
+        }
+
+        let query_ring = GpuRing::new(&fd)?;
+        let channel_ring = GpuRing::new(&fd)?;
+        let this = Context {
+            fd, query_ring, channel_ring
+        };
+        let init_cmd = CrossDomainInit {
+            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_INIT, mem::size_of::<CrossDomainInit>() as u16),
+            query_ring_id: this.query_ring.res_id,
+            channel_ring_id: this.channel_ring.res_id,
+            channel_type: CROSS_DOMAIN_CHANNEL_TYPE_X11,
+        };
+        this.submit_cmd(&init_cmd, mem::size_of::<CrossDomainInit>(), None, None)?;
+        this.poll_cmd()?;
+        Ok(this)
+    }
+    fn submit_cmd<T>(&self, cmd: &T, cmd_size: usize, ring_idx: Option<u32>, ring_handle: Option<u32>) -> Result<()> {
+        submit_cmd_raw(self.fd.as_raw_fd() as c_int, cmd, cmd_size, ring_idx, ring_handle)
+    }
+    fn poll_cmd(&self) -> Result<()> {
+        let cmd = CrossDomainPoll::new();
+        self.submit_cmd(&cmd, mem::size_of::<CrossDomainPoll>(), Some(CROSS_DOMAIN_CHANNEL_RING), None)
+    }
+}
+
+fn submit_cmd_raw<T>(fd: c_int, cmd: &T, cmd_size: usize, ring_idx: Option<u32>, ring_handle: Option<u32>) -> Result<()> {
+    let cmd_buf = cmd as *const T as *const u8;
+    let mut exec = DrmVirtgpuExecbuffer {
+        command: cmd_buf as u64,
+        size: cmd_size as u32,
+        ..DrmVirtgpuExecbuffer::default()
+    };
+    if let Some(ring_idx) = ring_idx {
+        exec.ring_idx = ring_idx;
+        exec.flags = VIRTGPU_EXECBUF_RING_IDX;
+    }
+    let ring_handle = &ring_handle;
+    if let Some(ring_handle) = ring_handle {
+        exec.bo_handles = ring_handle as *const u32 as u64;
+        exec.num_bo_handles = 1;
+    }
+    unsafe {
+        drm_virtgpu_execbuffer(fd, &mut exec)?;
+    }
+    if ring_handle.is_some() {
+        unimplemented!();
+    }
+    Ok(())
+}
+
+struct Client {
+    gpu_ctx: Context,
+    socket: UnixStream,
+    got_first_req: bool,
+    got_first_resp: bool,
+    dri3_ext_opcode: Option<u8>,
+    dri3_qe_resp_seq: Option<u16>,
+    seq_no: u16,
+    reply_tail: usize,
+    remote_futexes: u32,
+    request_tail: usize
+}
+
+struct PtrContainer(*const c_void);
+
+unsafe impl Send for PtrContainer {}
+
+impl Client {
+    fn new(socket: UnixStream) -> Result<Client> {
+        Ok(Client {
+            socket,
+            gpu_ctx: Context::new()?,
+            got_first_req: false,
+            dri3_ext_opcode: None,
+            dri3_qe_resp_seq: None,
+            seq_no: 1,
+            reply_tail: 0,
+            got_first_resp: false,
+            remote_futexes: 0,
+            request_tail: 0
+        })
+    }
+    fn process_socket(&mut self) -> Result<bool> {
+        let mut fdspace = cmsg_space!([RawFd; CROSS_DOMAIN_MAX_IDENTIFIERS]);
+        let mut ring_msg = CrossDomainSendReceive {
+            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_SEND, 0),
+            num_identifiers: 0,
+            opaque_data_size: 0,
+            identifiers: [0; CROSS_DOMAIN_MAX_IDENTIFIERS],
+            identifier_types: [0; CROSS_DOMAIN_MAX_IDENTIFIERS],
+            identifier_sizes: [0; CROSS_DOMAIN_MAX_IDENTIFIERS],
+            data: [0u8; CROSS_DOMAIN_SR_TAIL_SIZE],
+        };
+        let mut ioslice = [IoSliceMut::new(&mut ring_msg.data)];
+        let msg: RecvMsg<()> = recvmsg(self.socket.as_raw_fd(), &mut ioslice, Some(&mut fdspace), MsgFlags::empty())?;
+        let mut fds = Vec::new();
+        for cmsg in msg.cmsgs()? {
+            match cmsg {
+                ControlMessageOwned::ScmRights(rf) => {
+                    for fd in rf {
+                        fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                }
+                _ => unimplemented!()
+            }
+        }
+        let len = if let Some(iov) = msg.iovs().next() {
+            iov.len()
+        } else {
+            return Ok(true);
+        };
+        let buf = &mut ring_msg.data[..len];
+        if !self.got_first_req {
+            self.got_first_req = true;
+        } else {
+            let mut ptr = self.request_tail;
+            while ptr < buf.len() {
+                dbg!(buf[ptr], buf[ptr + 1]);
+                if buf[ptr] == X11_OPCODE_QUERY_EXTENSION {
+                    let namelen = u16::from_ne_bytes(buf[(ptr + 4)..(ptr + 6)].try_into().unwrap()) as usize;
+                    let name = String::from_utf8_lossy(&buf[(ptr + 8)..(ptr + 8 + namelen)]);
+                    dbg!(&name);
+                    if name == "DRI3" {
+                        self.dri3_qe_resp_seq = Some(self.seq_no);
+                    }
+                } else if Some(buf[ptr]) == self.dri3_ext_opcode {
+                    if buf[ptr + 1] == DRI3_OPCODE_OPEN {
+                        buf[ptr] = X11_OPCODE_NOP;
+                        let mut reply = [0u8; 32];
+                        reply[0] = 1;
+                        reply[1] = 1;
+                        reply[2] = (self.seq_no & 0xff) as u8;
+                        reply[3] = (self.seq_no >> 8) as u8;
+                        let render = File::options().read(true).write(true).open("/dev/dri/renderD128")?;
+                        let fds = [render.as_raw_fd()];
+                        let cmsgs = [ControlMessage::ScmRights(&fds)];
+                        sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(&reply)], &cmsgs, MsgFlags::empty(), None)?;
+                    }
+                }
+                self.seq_no = self.seq_no.wrapping_add(1);
+                let req_len = u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
+                ptr += req_len;
+            }
+            self.request_tail = ptr - buf.len();
+        }
+        let size = mem::size_of::<CrossDomainSendReceive<()>>() + buf.len();
+        ring_msg.opaque_data_size = buf.len() as u32;
+        ring_msg.hdr.cmd_size = size as u16;
+        ring_msg.num_identifiers = fds.len() as u32;
+        for (i, fd) in fds.iter().enumerate() {
+            let res = self.vgpu_id_from_prime(&mut ring_msg, i, fd.as_raw_fd());
+            if res.is_ok() {
+                continue;
+            }
+
+            linkat(Some(fd.as_raw_fd()), "", None, "/dev/shm/shm-11111111", AtFlags::AT_EMPTY_PATH)?;
+            let addr = PtrContainer(unsafe {
+                mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)?.as_ptr()
+            });
+            let ft_new_msg_size = mem::size_of::<CrossDomainFutexNew>();
+            let ft_msg = CrossDomainFutexNew {
+                hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_NEW, ft_new_msg_size as u16),
+                id: self.remote_futexes,
+                filename: 0x3131313131313131,
+                pad: 0,
+            };
+            self.gpu_ctx.submit_cmd(&ft_msg, ft_new_msg_size, None, None)?;
+            let remote_futexes = self.remote_futexes;
+            let fd = self.gpu_ctx.fd.as_raw_fd() as c_int;
+            thread::spawn(move || {
+                let uaddr = addr;
+                let op = nix::libc::FUTEX_WAKE_BITSET;
+                let val = c_int::MAX;
+                let timeout = ptr::null::<()>();
+                let uaddr2 = ptr::null::<()>();
+                let val3 = !1u32;
+                loop {
+                    let ft_signal_msg_size = mem::size_of::<CrossDomainFutexSignal>();
+                    thread::sleep(Duration::from_millis(33));
+                    let ft_signal_cmd = CrossDomainFutexSignal {
+                        hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_SIGNAL, ft_signal_msg_size as u16),
+                        id: remote_futexes,
+                        pad: 0
+                    };
+                    submit_cmd_raw(fd, &ft_signal_cmd, ft_signal_msg_size, None, None).unwrap();
+                    unsafe {
+                        nix::libc::syscall(nix::libc::SYS_futex, uaddr.0, op, val, timeout, uaddr2, val3);
+                    }
+                }
+            });
+            ring_msg.identifiers[i] = self.remote_futexes;
+            self.remote_futexes += 1;
+            ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
+        }
+        self.gpu_ctx.submit_cmd(&ring_msg, size, None, None)?;
+        _ = unlink("/dev/shm/shm-11111111");
+        Ok(false)
+    }
+    fn vgpu_id_from_prime<T>(&self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd: RawFd) -> Result<()> {
+        let mut to_handle = DrmPrimeHandle {
+            fd: fd.as_raw_fd(),
+            ..DrmPrimeHandle::default()
+        };
+        unsafe {
+            drm_prime_fd_to_handle(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_handle)?;
+        }
+        let mut res_info = DrmVirtgpuResourceInfo {
+            bo_handle: to_handle.handle,
+            ..DrmVirtgpuResourceInfo::default()
+        };
+        unsafe {
+            drm_virtgpu_resource_info(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut res_info)?;
+        }
+        ring_msg.identifiers[i] = res_info.res_handle;
+        ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB;
+        Ok(())
+    }
+    fn process_vgpu(&mut self) -> Result<()> {
+        let mut evt = DrmEvent::default();
+        read(
+            self.gpu_ctx.fd.as_raw_fd(),
+            unsafe {
+                slice::from_raw_parts_mut(&mut evt as *mut DrmEvent as *mut u8, mem::size_of::<DrmEvent>())
+            }
+        )?;
+        assert_eq!(evt.ty, VIRTGPU_EVENT_FENCE_SIGNALED);
+        let cmd = unsafe {
+            (self.gpu_ctx.channel_ring.address as *const CrossDomainHeader).as_ref().unwrap().cmd
+        };
+        assert_eq!(cmd, CROSS_DOMAIN_CMD_RECEIVE);
+        let recv = unsafe {
+            (self.gpu_ctx.channel_ring.address as *const CrossDomainSendReceive<[u8; CROSS_DOMAIN_SR_TAIL_SIZE]>).as_ref().unwrap()
+        };
+        self.process_receive(recv)?;
+        self.gpu_ctx.poll_cmd()
+    }
+    fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
+        let mut fds = Vec::with_capacity(recv.num_identifiers as usize);
+        for i in 0..recv.num_identifiers as usize {
+            assert_eq!(recv.identifier_types[i], CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB);
+            let mut create_blob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+                size: recv.identifier_sizes[i] as u64,
+                blob_id: recv.identifiers[i] as u64,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE | VIRTGPU_BLOB_FLAG_USE_SHAREABLE,
+                ..DrmVirtgpuResourceCreateBlob::default()
+            };
+            unsafe {
+                drm_virtgpu_resource_create_blob(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut create_blob)?;
+            }
+            let mut to_fd = DrmPrimeHandle {
+                handle: create_blob.bo_handle,
+                flags: O_RDWR as u32,
+                fd: -1,
+            };
+            unsafe {
+                drm_prime_handle_to_fd(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_fd)?;
+            }
+            fds.push(RawFd::from(to_fd.fd));
+        }
+        let data = &recv.data[..(recv.opaque_data_size as usize)];
+        if !self.got_first_resp {
+            self.got_first_resp = true;
+            self.reply_tail = u16::from_ne_bytes(data[6..8].try_into().unwrap()) as usize * 4 + 8;
+        }
+        let mut ptr = self.reply_tail;
+        while ptr < data.len() {
+            let seq_no = u16::from_ne_bytes(data[(ptr + 2)..(ptr + 4)].try_into().unwrap());
+            let is_reply = data[ptr] == X11_REPLY;
+            let len = if is_reply {
+                u32::from_ne_bytes(data[(ptr + 4)..(ptr + 8)].try_into().unwrap()) as usize * 4
+            } else {
+                0
+            } + 32;
+            if is_reply && Some(seq_no) == self.dri3_qe_resp_seq {
+                self.dri3_qe_resp_seq = None;
+                if data[ptr + 8] != 0 {
+                    self.dri3_ext_opcode = Some(data[ptr + 9]);
+                }
+            }
+            ptr += len;
+        }
+        self.reply_tail = ptr - data.len();
+        let cmsgs = if recv.num_identifiers == 0 {
+            Vec::new()
+        } else {
+            vec![ControlMessage::ScmRights(&fds)]
+        };
+        sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(data)], &cmsgs, MsgFlags::empty(), None)?;
+        Ok(())
+    }
+}
+
+fn main() {
+    let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
+    let sock_path = "/tmp/.X11-unix/X0";
+    _ = fs::remove_file(&sock_path);
+    let listen_sock = UnixListener::bind(sock_path).unwrap();
+    epoll.add(&listen_sock, EpollEvent::new(EpollFlags::EPOLLIN, listen_sock.as_raw_fd() as u64)).unwrap();
+    let mut client_sock = HashMap::<u64, Rc<RefCell<Client>>>::new();
+    let mut client_vgpu = HashMap::<u64, Rc<RefCell<Client>>>::new();
+    loop {
+        let mut evts = [EpollEvent::empty()];
+        match epoll.wait(&mut evts, EpollTimeout::NONE) {
+            Err(Errno::EINTR) | Ok(0) => {
+                continue;
+            },
+            Ok(_) => {},
+            e => {
+                e.unwrap();
+            },
+        }
+        let fd = evts[0].data();
+        if fd == listen_sock.as_raw_fd() as u64 {
+            let res = listen_sock.accept();
+            if res.is_err() {
+                eprintln!("Failed to accept a connection, error: {:?}", res.unwrap_err());
+                continue;
+            }
+            let stream = res.unwrap().0;
+            stream.set_nonblocking(true).unwrap();
+            let client = Rc::new(RefCell::new(Client::new(stream).unwrap()));
+            client_sock.insert(client.borrow().socket.as_raw_fd() as u64, client.clone());
+            epoll.add(&client.borrow().socket, EpollEvent::new(EpollFlags::EPOLLIN, client.borrow().socket.as_raw_fd() as u64)).unwrap();
+            client_vgpu.insert(client.borrow().gpu_ctx.fd.as_raw_fd() as u64, client.clone());
+            epoll.add(&client.borrow().gpu_ctx.fd, EpollEvent::new(EpollFlags::EPOLLIN, client.borrow().gpu_ctx.fd.as_raw_fd() as u64)).unwrap();
+        } else if let Some(client) = client_sock.get_mut(&fd) {
+            let hangup = client.borrow_mut().process_socket().unwrap();
+            if hangup {
+                let client = client.borrow();
+                let gpu_fd = client.gpu_ctx.fd.as_fd();
+                epoll.delete(gpu_fd).unwrap();
+                client_vgpu.remove(&(gpu_fd.as_raw_fd() as u64));
+                epoll.delete(&client.socket).unwrap();
+                drop(client);
+                client_sock.remove(&fd);
+            }
+        } else if let Some(client) = client_vgpu.get_mut(&fd) {
+            client.borrow_mut().process_vgpu().unwrap();
+        }
+    }
+}
