@@ -1,23 +1,33 @@
 use std::{fs, mem, ptr, slice, thread};
 use std::cell::{RefCell};
 use std::collections::HashMap;
+use std::ffi::{c_long, CString};
 use std::fs::File;
-use std::io::{IoSlice, IoSliceMut};
+use std::io::{IoSlice, IoSliceMut, Write};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::ptr::{NonNull};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
-use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr};
-use nix::libc::{c_int, off_t, c_void, O_RDWR};
+use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
+use nix::libc::{c_int, off_t, c_void, O_RDWR, lrand48, pid_t, c_ulonglong, user_regs_struct, SYS_dup3, SYS_close, SYS_mmap, SYS_munmap, SYS_openat, AT_FDCWD, PTRACE_EVENT_STOP, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, O_CLOEXEC, MAP_SHARED, MAP_FIXED};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use anyhow::Result;
 use nix::errno::Errno;
-use nix::fcntl::AtFlags;
-use nix::unistd::{linkat, read, unlink};
+use nix::unistd::{Pid, read};
 use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, RecvMsg, sendmsg};
+use nix::sys::ptrace;
+use nix::sys::ptrace::Options;
+use nix::sys::signal::{kill, Signal};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, getsockopt, MsgFlags, recvmsg, RecvMsg, sendmsg};
+use nix::sys::socket::sockopt::PeerCredentials;
+use nix::sys::stat::fstat;
+use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -38,6 +48,11 @@ const X11_OPCODE_QUERY_EXTENSION: u8 = 98;
 const X11_OPCODE_NOP: u8 = 127;
 const X11_REPLY: u8 = 1;
 const DRI3_OPCODE_OPEN: u8 = 1;
+const DRI3_OPCODE_PIXMAP_FROM_BUFFER: u8 = 2;
+const DRI3_OPCODE_FENCE_FROM_FD: u8 = 4;
+const SYNC_OPCODE_DESTROY_FENCE: u8 = 17;
+const DRI3_OPCODE_PIXMAP_FROM_BUFFERS: u8 = 7;
+
 
 #[repr(C)]
 #[derive(Default)]
@@ -58,7 +73,7 @@ ioctl_readwrite!(drm_virtgpu_context_init, 'd', 0x40 + 0xb, DrmVirtgpuContextIni
 
 #[repr(C)]
 #[derive(Default)]
-        struct DrmVirtgpuResourceCreateBlob {
+struct DrmVirtgpuResourceCreateBlob {
     blob_mem: u32,
     blob_flags: u32,
     bo_handle: u32,
@@ -206,11 +221,19 @@ struct CrossDomainFutexSignal {
     pad: u32,
 }
 
+#[repr(C)]
+struct CrossDomainFutexDestroy {
+    hdr: CrossDomainHeader,
+    id: u32,
+    pad: u32,
+}
+
 const CROSS_DOMAIN_MAX_IDENTIFIERS: usize = 4;
 const CROSS_DOMAIN_CMD_SEND: u8 = 4;
 const CROSS_DOMAIN_CMD_RECEIVE: u8 = 5;
 const CROSS_DOMAIN_CMD_FUTEX_NEW: u8 = 8;
 const CROSS_DOMAIN_CMD_FUTEX_SIGNAL: u8 = 9;
+pub const CROSS_DOMAIN_CMD_FUTEX_DESTROY: u8 = 10;
 
 #[repr(C)]
 struct CrossDomainSendReceive<T: ?Sized> {
@@ -359,21 +382,222 @@ fn submit_cmd_raw<T>(fd: c_int, cmd: &T, cmd_size: usize, ring_idx: Option<u32>,
 }
 
 struct Client {
+    // futex_watchers must be dropped before gpu_ctx, so it goes first
+    futex_watchers: HashMap<u32, FutexWatcherThread>,
     gpu_ctx: Context,
     socket: UnixStream,
     got_first_req: bool,
     got_first_resp: bool,
     dri3_ext_opcode: Option<u8>,
     dri3_qe_resp_seq: Option<u16>,
+    sync_ext_opcode: Option<u8>,
+    sync_qe_resp_seq: Option<u16>,
     seq_no: u16,
     reply_tail: usize,
-    remote_futexes: u32,
-    request_tail: usize
+    request_tail: usize,
 }
 
-struct PtrContainer(*const c_void);
+#[derive(Clone)]
+struct FutexPtr(*mut c_void);
 
-unsafe impl Send for PtrContainer {}
+unsafe impl Send for FutexPtr {}
+
+impl Drop for FutexPtr {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(NonNull::new_unchecked(self.0), 4).unwrap();
+        }
+    }
+}
+
+fn extract_opcode_from_qe_resp(data: &[u8], ptr: usize) -> Option<u8> {
+    if data[ptr + 8] != 0 {
+        Some(data[ptr + 9])
+    } else {
+        None
+    }
+}
+
+struct FutexWatcherThread {
+    join_handle: Option<JoinHandle<()>>,
+    join_handle2: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    futex: FutexPtr
+}
+
+unsafe fn wake_futex(futex: *mut c_void, val3: u32) {
+    let op = nix::libc::FUTEX_WAKE_BITSET;
+    let val = c_int::MAX;
+    let timeout = ptr::null::<()>();
+    let uaddr2 = ptr::null::<()>();
+    unsafe {
+        nix::libc::syscall(nix::libc::SYS_futex, futex, op, val, timeout, uaddr2, val3);
+    }
+}
+
+impl FutexWatcherThread {
+    fn new(fd: c_int, xid: u32, futex: FutexPtr) -> FutexWatcherThread {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = shutdown.clone();
+        let shutdown3 = shutdown.clone();
+        let futex2 = futex.clone();
+        let futex3 = futex.clone();
+        let handle = thread::spawn(move || {
+            let uaddr = futex3;
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                unsafe {
+                    //wake_futex(uaddr.0, !1);
+                }
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+        let handle2 = thread::spawn(move || {
+            let uaddr = futex2;
+            let op = nix::libc::FUTEX_WAIT_BITSET;
+            let timeout = ptr::null::<()>();
+            let uaddr2 = ptr::null::<()>();
+            let val3 = 1u32;
+            let atomic_val = unsafe {
+                AtomicU32::from_ptr(uaddr.0 as *mut u32)
+            };
+            loop {
+                if shutdown3.load(Ordering::SeqCst) {
+                    break;
+                }
+                let val = atomic_val.load(Ordering::SeqCst);
+                unsafe {
+                    nix::libc::syscall(nix::libc::SYS_futex, uaddr.0, op, val, timeout, uaddr2, val3);
+                }
+                let ft_signal_msg_size = mem::size_of::<CrossDomainFutexSignal>();
+                let ft_signal_cmd = CrossDomainFutexSignal {
+                    hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_SIGNAL, ft_signal_msg_size as u16),
+                    id: xid,
+                    pad: 0
+                };
+                submit_cmd_raw(fd, &ft_signal_cmd, ft_signal_msg_size, None, None).unwrap();
+            }
+        });
+        FutexWatcherThread {
+            futex,
+            join_handle: Some(handle),
+            join_handle2: Some(handle2),
+            shutdown: shutdown2
+        }
+    }
+}
+
+impl Drop for FutexWatcherThread {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        unsafe {
+            wake_futex(self.futex.0, !0);
+        }
+        self.join_handle.take().unwrap().join().unwrap();
+        self.join_handle2.take().unwrap().join().unwrap();
+    }
+}
+
+struct RemoteCaller {
+    pid: Pid,
+    old_regs: user_regs_struct,
+}
+
+impl RemoteCaller {
+    fn with<R, F>(pid: Pid, f: F) -> Result<R> where F: FnOnce(&RemoteCaller) -> Result<R> {
+        let old_regs = ptrace::getregs(pid)?;
+        {
+            // Writing to a dax-backed shared page via ptrace is broken, and causes everything except
+            // for the address to be filled with zeroes.
+            // Force the page to become private and restore its contents.
+            let mut page = vec![0; PAGE_SIZE];
+            let aligned_addr = old_regs.pc as usize & !(PAGE_SIZE - 1);
+            process_vm_readv(pid, &mut [IoSliceMut::new(&mut page)], &[RemoteIoVec {
+                base: aligned_addr,
+                len: PAGE_SIZE
+            }])?;
+            for i in 0..(PAGE_SIZE / 8) {
+                let offset = i * 8;
+                let val = i64::from_ne_bytes(page[offset..(offset + 8)].try_into().unwrap());
+                ptrace::write(pid, (aligned_addr + offset) as *mut c_void, val)?;
+            }
+            /*
+            process_vm_writev(pid, &[IoSlice::new(&page)], &[RemoteIoVec {
+                base: aligned_addr,
+                len: PAGE_SIZE
+            }])?;
+            */
+        }
+        let old_instr = ptrace::read(pid, old_regs.pc as *mut c_void)?;
+        ptrace::write(pid, old_regs.pc as *mut c_void, 0xd4000001u64 as i64)?;
+        let res = f(&RemoteCaller {
+            old_regs, pid
+        })?;
+        ptrace::write(pid, old_regs.pc as *mut c_void, old_instr)?;
+        ptrace::setregs(pid, old_regs)?;
+        Ok(res)
+    }
+    fn dup2(&self, oldfd: i32, newfd: i32) -> Result<i32> {
+        self.syscall(SYS_dup3, [oldfd as u64, newfd as u64, 0, 0, 0, 0]).map(|x| x as i32)
+    }
+    fn close(&self, fd: i32) -> Result<i32> {
+        self.syscall(SYS_close, [fd as u64, 0, 0, 0, 0, 0]).map(|x| x as i32)
+    }
+    fn mmap(&self, addr: usize, length: usize, prot: i32, flags: i32, fd: i32, offset: usize) -> Result<usize> {
+        self.syscall(SYS_mmap, [
+            addr as u64, length as u64, prot as u64, flags as u64, fd as u64, offset as u64
+        ]).map(|x| x as usize)
+    }
+    fn munmap(&self, addr: usize, length: usize) -> Result<i32> {
+        self.syscall(SYS_munmap, [
+            addr as u64, length as u64, 0, 0, 0, 0
+        ]).map(|x| x as i32)
+    }
+    fn open(&self, path: usize, flags: i32, mode: i32) -> Result<i32> {
+        self.syscall(SYS_openat, [
+            AT_FDCWD as u64, path as u64, flags as u64, mode as u64, 0, 0
+        ]).map(|x| x as i32)
+    }
+    fn syscall(&self, syscall_no: c_long, args: [c_ulonglong; 6]) -> Result<c_ulonglong> {
+        let mut regs = self.old_regs;
+        for i in 0..6 {
+            regs.regs[i] = args[i];
+        }
+        regs.regs[8] = syscall_no as c_ulonglong;
+        ptrace::setregs(self.pid, regs)?;
+        ptrace::step(self.pid, None)?;
+        let evt = waitpid(self.pid, Some(WaitPidFlag::__WALL))?;
+        if !matches!(evt, WaitStatus::Stopped(_, _)) {
+            unimplemented!();
+        }
+        regs = ptrace::getregs(self.pid)?;
+        Ok(regs.regs[0])
+    }
+}
+
+fn wait_for_group_stop(pid: Pid) -> Result<()> {
+    loop {
+        let event = waitpid(pid, Some(WaitPidFlag::__WALL))?;
+        match event {
+            WaitStatus::Stopped(_, sig) => {
+                ptrace::cont(pid, sig)?;
+            }
+            WaitStatus::PtraceEvent(_, sig, status) => {
+                if status != PTRACE_EVENT_STOP {
+                    unimplemented!();
+                }
+                if sig == Signal::SIGSTOP {
+                    return Ok(());
+                } else {
+                    ptrace::cont(pid, None)?;
+                }
+            }
+            _ => unimplemented!()
+        }
+    }
+}
 
 impl Client {
     fn new(socket: UnixStream) -> Result<Client> {
@@ -383,11 +607,13 @@ impl Client {
             got_first_req: false,
             dri3_ext_opcode: None,
             dri3_qe_resp_seq: None,
+            sync_ext_opcode: None,
+            sync_qe_resp_seq: None,
             seq_no: 1,
             reply_tail: 0,
             got_first_resp: false,
-            remote_futexes: 0,
-            request_tail: 0
+            request_tail: 0,
+            futex_watchers: HashMap::new(),
         })
     }
     fn process_socket(&mut self) -> Result<bool> {
@@ -420,18 +646,21 @@ impl Client {
             return Ok(true);
         };
         let buf = &mut ring_msg.data[..len];
+        let mut fd_xids = [None; CROSS_DOMAIN_MAX_IDENTIFIERS];
+        let mut cur_fd_for_msg = 0;
+        let mut fences_to_destroy = Vec::new();
         if !self.got_first_req {
             self.got_first_req = true;
         } else {
             let mut ptr = self.request_tail;
             while ptr < buf.len() {
-                dbg!(buf[ptr], buf[ptr + 1]);
                 if buf[ptr] == X11_OPCODE_QUERY_EXTENSION {
                     let namelen = u16::from_ne_bytes(buf[(ptr + 4)..(ptr + 6)].try_into().unwrap()) as usize;
                     let name = String::from_utf8_lossy(&buf[(ptr + 8)..(ptr + 8 + namelen)]);
-                    dbg!(&name);
                     if name == "DRI3" {
                         self.dri3_qe_resp_seq = Some(self.seq_no);
+                    } else if name == "SYNC" {
+                        self.sync_qe_resp_seq = Some(self.seq_no)
                     }
                 } else if Some(buf[ptr]) == self.dri3_ext_opcode {
                     if buf[ptr + 1] == DRI3_OPCODE_OPEN {
@@ -445,6 +674,19 @@ impl Client {
                         let fds = [render.as_raw_fd()];
                         let cmsgs = [ControlMessage::ScmRights(&fds)];
                         sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(&reply)], &cmsgs, MsgFlags::empty(), None)?;
+                    } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFER {
+                        cur_fd_for_msg += 1;
+                    } else if buf[ptr + 1] == DRI3_OPCODE_FENCE_FROM_FD {
+                        let xid = u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
+                        fd_xids[cur_fd_for_msg] = Some(xid);
+                        cur_fd_for_msg += 1;
+                    } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFERS {
+                        cur_fd_for_msg += buf[ptr + 12] as usize;
+                    }
+                } else if Some(buf[ptr]) == self.sync_ext_opcode {
+                    if buf[ptr + 1] == SYNC_OPCODE_DESTROY_FENCE {
+                        let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
+                        fences_to_destroy.push(xid);
                     }
                 }
                 self.seq_no = self.seq_no.wrapping_add(1);
@@ -453,62 +695,40 @@ impl Client {
             }
             self.request_tail = ptr - buf.len();
         }
+        assert_eq!(cur_fd_for_msg, fds.len());
         let size = mem::size_of::<CrossDomainSendReceive<()>>() + buf.len();
         ring_msg.opaque_data_size = buf.len() as u32;
         ring_msg.hdr.cmd_size = size as u16;
         ring_msg.num_identifiers = fds.len() as u32;
+        let shmem_name = [0x30u8; 8].map(|x| x + unsafe {lrand48() % 10} as u8);
+        let mut shmem_path = "/dev/shm/shm-".to_owned();
+        for c in shmem_name {
+            shmem_path.push(c as char);
+        }
         for (i, fd) in fds.iter().enumerate() {
             let res = self.vgpu_id_from_prime(&mut ring_msg, i, fd.as_raw_fd());
             if res.is_ok() {
                 continue;
             }
-
-            linkat(Some(fd.as_raw_fd()), "", None, "/dev/shm/shm-11111111", AtFlags::AT_EMPTY_PATH)?;
-            let addr = PtrContainer(unsafe {
-                mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)?.as_ptr()
-            });
-            let ft_new_msg_size = mem::size_of::<CrossDomainFutexNew>();
-            let ft_msg = CrossDomainFutexNew {
-                hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_NEW, ft_new_msg_size as u16),
-                id: self.remote_futexes,
-                filename: 0x3131313131313131,
-                pad: 0,
-            };
-            self.gpu_ctx.submit_cmd(&ft_msg, ft_new_msg_size, None, None)?;
-            let remote_futexes = self.remote_futexes;
-            let fd = self.gpu_ctx.fd.as_raw_fd() as c_int;
-            thread::spawn(move || {
-                let uaddr = addr;
-                let op = nix::libc::FUTEX_WAKE_BITSET;
-                let val = c_int::MAX;
-                let timeout = ptr::null::<()>();
-                let uaddr2 = ptr::null::<()>();
-                let val3 = !1u32;
-                loop {
-                    let ft_signal_msg_size = mem::size_of::<CrossDomainFutexSignal>();
-                    thread::sleep(Duration::from_millis(33));
-                    let ft_signal_cmd = CrossDomainFutexSignal {
-                        hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_SIGNAL, ft_signal_msg_size as u16),
-                        id: remote_futexes,
-                        pad: 0
-                    };
-                    submit_cmd_raw(fd, &ft_signal_cmd, ft_signal_msg_size, None, None).unwrap();
-                    unsafe {
-                        nix::libc::syscall(nix::libc::SYS_futex, uaddr.0, op, val, timeout, uaddr2, val3);
-                    }
-                }
-            });
-            ring_msg.identifiers[i] = self.remote_futexes;
-            self.remote_futexes += 1;
-            ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
+            let creds = getsockopt(&self.socket.as_fd(), PeerCredentials)?;
+            self.create_cross_vm_futex(&mut ring_msg, i, fd, &fd_xids, creds.pid())?;
         }
         self.gpu_ctx.submit_cmd(&ring_msg, size, None, None)?;
-        _ = unlink("/dev/shm/shm-11111111");
+        for xid in fences_to_destroy {
+            self.futex_watchers.remove(&xid).unwrap();
+            let ft_destroy_msg_size = mem::size_of::<CrossDomainFutexDestroy>();
+            let ft_msg = CrossDomainFutexDestroy {
+                hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_DESTROY, ft_destroy_msg_size as u16),
+                id: xid,
+                pad: 0,
+            };
+            self.gpu_ctx.submit_cmd(&ft_msg, ft_destroy_msg_size, None, None)?;
+        }
         Ok(false)
     }
     fn vgpu_id_from_prime<T>(&self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd: RawFd) -> Result<()> {
         let mut to_handle = DrmPrimeHandle {
-            fd: fd.as_raw_fd(),
+            fd,
             ..DrmPrimeHandle::default()
         };
         unsafe {
@@ -523,6 +743,90 @@ impl Client {
         }
         ring_msg.identifiers[i] = res_info.res_handle;
         ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB;
+        Ok(())
+    }
+
+    fn replace_futex_storage(my_fd: RawFd, pid: Pid, shmem_path: &str) -> Result<()> {
+        ptrace::seize(pid, Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_EXITKILL)?;
+        kill(pid, Signal::SIGSTOP)?;
+        wait_for_group_stop(pid)?;
+        let my_ino = fstat(my_fd)?.st_ino;
+        let mut fds_to_replace = Vec::new();
+        for entry in fs::read_dir(format!("/proc/{}/fd", pid))? {
+            let entry = entry?;
+            if let Ok(file) = File::options().open(&entry.path()) {
+                if fstat(file.as_raw_fd())?.st_ino == my_ino {
+                    fds_to_replace.push(entry.file_name().to_string_lossy().parse::<i32>()?);
+                }
+            }
+        }
+        let mut pages_to_replace = Vec::new();
+        for entry in fs::read_dir(format!("/proc/{}/map_files/", pid))? {
+            let entry = entry?;
+            if let Ok(file) = File::open(&entry.path()) {
+                if fstat(file.as_raw_fd())?.st_ino != my_ino {
+                    continue;
+                }
+                let addr = usize::from_str_radix(entry.file_name().to_string_lossy().split('-').next().unwrap(), 16)?;
+                pages_to_replace.push(addr);
+            }
+        }
+        RemoteCaller::with(pid, |caller| {
+            let scratch_page = caller.mmap(
+                0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0
+            )?;
+            let path_cstr = CString::new(shmem_path).unwrap();
+            process_vm_writev(pid, &[IoSlice::new(path_cstr.as_bytes_with_nul())], &[RemoteIoVec {
+                base: scratch_page,
+                len: path_cstr.len()
+            }])?;
+            let remote_shm = caller.open(scratch_page, O_CLOEXEC | O_RDWR, 0o600)?;
+            for fd in fds_to_replace {
+                caller.dup2(remote_shm, fd)?;
+            }
+            for page in pages_to_replace {
+                caller.mmap(
+                    page, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, remote_shm, 0
+                )?;
+            }
+            caller.munmap(scratch_page, PAGE_SIZE)?;
+            caller.close(remote_shm)?;
+            Ok(())
+        })?;
+        ptrace::detach(pid, None)?;
+        kill(pid, Signal::SIGCONT)?;
+        Ok(())
+    }
+    fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: &OwnedFd, fd_xids: &[Option<u32>], pid: pid_t) -> Result<()> {
+        let shmem_name = [0x30u8; 8].map(|x| x + unsafe {lrand48() % 10} as u8);
+        let mut shmem_path = "/dev/shm/shm-".to_owned();
+        for c in shmem_name {
+            shmem_path.push(c as char);
+        }
+        let mut shmem_file = File::options().read(true).write(true).create(true).open(&shmem_path)?;
+        shmem_file.set_len(4)?;
+        let mut data = [0; 4];
+        read(memfd.as_raw_fd(), &mut data)?;
+        shmem_file.write_all(&data)?;
+        Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
+        let addr = FutexPtr(unsafe {
+            mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, shmem_file, 0)?.as_ptr()
+        });
+        let ft_new_msg_size = mem::size_of::<CrossDomainFutexNew>();
+        let ft_msg = CrossDomainFutexNew {
+            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_NEW, ft_new_msg_size as u16),
+            id: fd_xids[i].unwrap(),
+            filename: u64::from_ne_bytes(shmem_name),
+            pad: 0,
+        };
+        self.gpu_ctx.submit_cmd(&ft_msg, ft_new_msg_size, None, None)?;
+        let sync_xid = fd_xids[i].unwrap();
+        let fd = self.gpu_ctx.fd.as_raw_fd() as c_int;
+        // TODO: do we need to wait here?
+        //thread::sleep(Duration::from_millis(33));
+        self.futex_watchers.insert(sync_xid, FutexWatcherThread::new(fd, sync_xid, addr));
+        ring_msg.identifiers[i] = sync_xid;
+        ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
         Ok(())
     }
     fn process_vgpu(&mut self) -> Result<()> {
@@ -546,6 +850,7 @@ impl Client {
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
         let mut fds = Vec::with_capacity(recv.num_identifiers as usize);
+        assert_eq!(recv.num_identifiers, 0);
         for i in 0..recv.num_identifiers as usize {
             assert_eq!(recv.identifier_types[i], CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB);
             let mut create_blob = DrmVirtgpuResourceCreateBlob {
@@ -582,10 +887,13 @@ impl Client {
             } else {
                 0
             } + 32;
-            if is_reply && Some(seq_no) == self.dri3_qe_resp_seq {
-                self.dri3_qe_resp_seq = None;
-                if data[ptr + 8] != 0 {
-                    self.dri3_ext_opcode = Some(data[ptr + 9]);
+            if is_reply {
+                if Some(seq_no) == self.dri3_qe_resp_seq {
+                    self.dri3_qe_resp_seq = None;
+                    self.dri3_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
+                } else if Some(seq_no) == self.sync_qe_resp_seq {
+                    self.sync_qe_resp_seq = None;
+                    self.sync_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
                 }
             }
             ptr += len;
@@ -635,7 +943,11 @@ fn main() {
             client_vgpu.insert(client.borrow().gpu_ctx.fd.as_raw_fd() as u64, client.clone());
             epoll.add(&client.borrow().gpu_ctx.fd, EpollEvent::new(EpollFlags::EPOLLIN, client.borrow().gpu_ctx.fd.as_raw_fd() as u64)).unwrap();
         } else if let Some(client) = client_sock.get_mut(&fd) {
-            let hangup = client.borrow_mut().process_socket().unwrap();
+            let res = client.borrow_mut().process_socket();
+            let hangup = res.is_err() || *res.as_ref().unwrap();
+            if res.is_err() {
+                eprintln!("Client disconnected with error: {:?}", res.unwrap_err());
+            }
             if hangup {
                 let client = client.borrow();
                 let gpu_fd = client.gpu_ctx.fd.as_fd();
