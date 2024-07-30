@@ -700,11 +700,6 @@ impl Client {
         ring_msg.opaque_data_size = buf.len() as u32;
         ring_msg.hdr.cmd_size = size as u16;
         ring_msg.num_identifiers = fds.len() as u32;
-        let shmem_name = [0x30u8; 8].map(|x| x + unsafe {lrand48() % 10} as u8);
-        let mut shmem_path = "/dev/shm/shm-".to_owned();
-        for c in shmem_name {
-            shmem_path.push(c as char);
-        }
         for (i, fd) in fds.iter().enumerate() {
             let res = self.vgpu_id_from_prime(&mut ring_msg, i, fd.as_raw_fd());
             if res.is_ok() {
@@ -850,7 +845,6 @@ impl Client {
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
         let mut fds = Vec::with_capacity(recv.num_identifiers as usize);
-        assert_eq!(recv.num_identifiers, 0);
         for i in 0..recv.num_identifiers as usize {
             assert_eq!(recv.identifier_types[i], CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB);
             let mut create_blob = DrmVirtgpuResourceCreateBlob {
