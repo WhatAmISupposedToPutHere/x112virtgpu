@@ -3,7 +3,7 @@ use std::cell::{RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
 use std::fs::File;
-use std::io::{IoSlice, IoSliceMut, Write};
+use std::io::{ErrorKind, IoSlice, IoSliceMut, Write};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
-use nix::libc::{c_int, off_t, c_void, O_RDWR, lrand48, pid_t, c_ulonglong, user_regs_struct, SYS_dup3, SYS_close, SYS_mmap, SYS_munmap, SYS_openat, AT_FDCWD, PTRACE_EVENT_STOP, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, O_CLOEXEC, MAP_SHARED, MAP_FIXED};
+use nix::libc::{c_int, off_t, c_void, O_RDWR, pid_t, c_ulonglong, user_regs_struct, SYS_dup3, SYS_close, SYS_mmap, SYS_munmap, SYS_openat, AT_FDCWD, PTRACE_EVENT_STOP, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, O_CLOEXEC, MAP_SHARED, MAP_FIXED};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use anyhow::Result;
 use nix::errno::Errno;
@@ -28,6 +28,7 @@ use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::stat::fstat;
 use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use rand::Rng;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -793,12 +794,22 @@ impl Client {
         Ok(())
     }
     fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: &OwnedFd, fd_xids: &[Option<u32>], pid: pid_t) -> Result<()> {
-        let shmem_name = [0x30u8; 8].map(|x| x + unsafe {lrand48() % 10} as u8);
-        let mut shmem_path = "/dev/shm/shm-".to_owned();
-        for c in shmem_name {
-            shmem_path.push(c as char);
-        }
-        let mut shmem_file = File::options().read(true).write(true).create(true).open(&shmem_path)?;
+        let mut rng = rand::thread_rng();
+        let mut shmem_name;
+        let mut shmem_path;
+        let mut shmem_file = loop {
+            shmem_name = [0x30u8; 8].map(|x| x + rng.gen_range(0..10));
+            shmem_path = "/dev/shm/shm-".to_owned();
+            for c in shmem_name {
+                shmem_path.push(c as char);
+            }
+            let result = File::options().read(true).write(true).create_new(true).open(&shmem_path);
+            match result {
+                Ok(file) => break file,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {},
+                e => {e?;},
+            }
+        };
         shmem_file.set_len(4)?;
         let mut data = [0; 4];
         read(memfd.as_raw_fd(), &mut data)?;
