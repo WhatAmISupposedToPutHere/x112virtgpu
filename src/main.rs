@@ -3,10 +3,11 @@ use std::cell::{RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
 use std::fs::File;
-use std::io::{BufRead, ErrorKind, IoSlice, IoSliceMut, Read, Write};
+use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::ptr::{NonNull};
 use std::rc::Rc;
@@ -19,6 +20,7 @@ use nix::libc::{c_int, off_t, c_void, O_RDWR, pid_t, c_ulonglong, user_regs_stru
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use anyhow::Result;
 use nix::errno::Errno;
+use nix::fcntl::readlink;
 use nix::unistd::{Pid, read};
 use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
 use nix::sys::ptrace;
@@ -29,7 +31,6 @@ use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::stat::fstat;
 use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use rand::Rng;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -54,7 +55,6 @@ const DRI3_OPCODE_PIXMAP_FROM_BUFFER: u8 = 2;
 const DRI3_OPCODE_FENCE_FROM_FD: u8 = 4;
 const SYNC_OPCODE_DESTROY_FENCE: u8 = 17;
 const DRI3_OPCODE_PIXMAP_FROM_BUFFERS: u8 = 7;
-
 
 #[repr(C)]
 #[derive(Default)]
@@ -834,27 +834,26 @@ impl Client {
         Ok(())
     }
     fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: &OwnedFd, fd_xids: &[Option<u32>], pid: pid_t) -> Result<()> {
-        let mut rng = rand::thread_rng();
+        let name = readlink(format!("/proc/self/fd/{}", memfd.as_raw_fd()).as_str())?;
+        let mut shmem_file;
         let mut shmem_name;
-        let mut shmem_path;
-        let mut shmem_file = loop {
-            shmem_name = [0x30u8; 8].map(|x| x + rng.gen_range(0..10));
-            shmem_path = "/dev/shm/shm-".to_owned();
+        if name.to_string_lossy().starts_with(util::SHM_PREFIX) {
+            shmem_name = [0; 8];
+            for i in 0..8 {
+                shmem_name[i] = name.as_bytes()[i + util::SHM_PREFIX.len()];
+            }
+            shmem_file = File::from(memfd.try_clone().unwrap());
+        } else {
+            (shmem_name, shmem_file) = util::create_shm_file()?;
+            let mut shmem_path = util::SHM_PREFIX.to_owned();
             for c in shmem_name {
                 shmem_path.push(c as char);
             }
-            let result = File::options().read(true).write(true).create_new(true).open(&shmem_path);
-            match result {
-                Ok(file) => break file,
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {},
-                e => {e?;},
-            }
-        };
-        shmem_file.set_len(4)?;
-        let mut data = [0; 4];
-        read(memfd.as_raw_fd(), &mut data)?;
-        shmem_file.write_all(&data)?;
-        Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
+            let mut data = [0; 4];
+            read(memfd.as_raw_fd(), &mut data)?;
+            shmem_file.write_all(&data)?;
+            Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
+        }
         let addr = FutexPtr(unsafe {
             mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, shmem_file, 0)?.as_ptr()
         });

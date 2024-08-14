@@ -3,7 +3,10 @@ name = "x112virtgpu"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members =  ["preload", "util", "."]
+
 [dependencies]
 nix = { version = "0.29", features = ["event", "socket", "ioctl", "mman", "socket", "uio", "fs", "ptrace", "signal"] }
 anyhow = "1"
-rand = "0.8"
+util = { path = "util" }
