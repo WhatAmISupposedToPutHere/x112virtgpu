@@ -1,9 +1,10 @@
-use std::{fs, mem, ptr, slice, thread};
+use std::{env, fs, mem, ptr, slice, thread};
 use std::cell::{RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
 use std::fs::File;
-use std::io::{ErrorKind, IoSlice, IoSliceMut, Write};
+use std::io::{BufRead, ErrorKind, IoSlice, IoSliceMut, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -382,6 +383,42 @@ fn submit_cmd_raw<T>(fd: c_int, cmd: &T, cmd_size: usize, ring_idx: Option<u32>,
     Ok(())
 }
 
+struct DebugLoopInner {
+    ls_remote: TcpStream,
+    ls_local: TcpStream,
+}
+
+struct DebugLoop(Option<DebugLoopInner>);
+
+impl DebugLoop {
+    fn new() -> DebugLoop {
+        if !env::var("X11VG_DEBUG").map(|x| x == "1").unwrap_or_default() {
+            return DebugLoop(None);
+        }
+        let ls_remote_l = TcpListener::bind(("0.0.0.0", 6001)).unwrap();
+        let ls_local_jh = thread::spawn(|| TcpStream::connect(("0.0.0.0", 6001)).unwrap());
+        let ls_remote = ls_remote_l.accept().unwrap().0;
+        let ls_local = ls_local_jh.join().unwrap();
+        DebugLoop(Some(DebugLoopInner {
+            ls_remote, ls_local
+        }))
+    }
+    fn loop_remote(&mut self, data: &[u8]) {
+        if let Some(this) = &mut self.0 {
+            this.ls_remote.write_all(data).unwrap();
+            let mut trash = vec![0; data.len()];
+            this.ls_local.read_exact(&mut trash).unwrap();
+        }
+    }
+    fn loop_local(&mut self, data: &[u8]) {
+        if let Some(this) = &mut self.0 {
+            this.ls_local.write_all(data).unwrap();
+            let mut trash = vec![0; data.len()];
+            this.ls_remote.read_exact(&mut trash).unwrap();
+        }
+    }
+}
+
 struct Client {
     // futex_watchers must be dropped before gpu_ctx, so it goes first
     futex_watchers: HashMap<u32, FutexWatcherThread>,
@@ -396,6 +433,7 @@ struct Client {
     seq_no: u16,
     reply_tail: usize,
     request_tail: usize,
+    debug_loop: DebugLoop
 }
 
 #[derive(Clone)]
@@ -615,6 +653,7 @@ impl Client {
             got_first_resp: false,
             request_tail: 0,
             futex_watchers: HashMap::new(),
+            debug_loop: DebugLoop::new(),
         })
     }
     fn process_socket(&mut self) -> Result<bool> {
@@ -647,6 +686,7 @@ impl Client {
             return Ok(true);
         };
         let buf = &mut ring_msg.data[..len];
+        self.debug_loop.loop_local(buf);
         let mut fd_xids = [None; CROSS_DOMAIN_MAX_IDENTIFIERS];
         let mut cur_fd_for_msg = 0;
         let mut fences_to_destroy = Vec::new();
@@ -879,6 +919,7 @@ impl Client {
             fds.push(RawFd::from(to_fd.fd));
         }
         let data = &recv.data[..(recv.opaque_data_size as usize)];
+        self.debug_loop.loop_remote(data);
         if !self.got_first_resp {
             self.got_first_resp = true;
             self.reply_tail = u16::from_ne_bytes(data[6..8].try_into().unwrap()) as usize * 4 + 8;
