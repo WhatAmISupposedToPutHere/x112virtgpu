@@ -1,4 +1,5 @@
 use std::{env, fs, mem, ptr, slice, thread};
+use std::borrow::Cow;
 use std::cell::{RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
@@ -6,8 +7,7 @@ use std::fs::File;
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::ptr::{NonNull};
 use std::rc::Rc;
@@ -47,6 +47,7 @@ const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x90000000;
 const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
 const CROSS_DOMAIN_ID_TYPE_SHM: u32 = 5;
 
+const X11_OPCODE_FREE_PIXMAP: u8 = 54;
 const X11_OPCODE_QUERY_EXTENSION: u8 = 98;
 const X11_OPCODE_NOP: u8 = 127;
 const X11_REPLY: u8 = 1;
@@ -55,6 +56,7 @@ const DRI3_OPCODE_PIXMAP_FROM_BUFFER: u8 = 2;
 const DRI3_OPCODE_FENCE_FROM_FD: u8 = 4;
 const SYNC_OPCODE_DESTROY_FENCE: u8 = 17;
 const DRI3_OPCODE_PIXMAP_FROM_BUFFERS: u8 = 7;
+const PRESENT_OPCODE_PRESENT_PIXMAP: u8 = 1;
 
 #[repr(C)]
 #[derive(Default)]
@@ -430,10 +432,13 @@ struct Client {
     dri3_qe_resp_seq: Option<u16>,
     sync_ext_opcode: Option<u8>,
     sync_qe_resp_seq: Option<u16>,
+    present_ext_opcode: Option<u8>,
+    present_qe_resp_seq: Option<u16>,
     seq_no: u16,
     reply_tail: usize,
     request_tail: usize,
-    debug_loop: DebugLoop
+    debug_loop: DebugLoop,
+    buffers_for_pixmap: HashMap<u32, Vec<OwnedFd>>
 }
 
 #[derive(Clone)]
@@ -648,12 +653,15 @@ impl Client {
             dri3_qe_resp_seq: None,
             sync_ext_opcode: None,
             sync_qe_resp_seq: None,
+            present_qe_resp_seq: None,
+            present_ext_opcode: None,
             seq_no: 1,
             reply_tail: 0,
             got_first_resp: false,
             request_tail: 0,
             futex_watchers: HashMap::new(),
             debug_loop: DebugLoop::new(),
+            buffers_for_pixmap: HashMap::new(),
         })
     }
     fn process_socket(&mut self) -> Result<bool> {
@@ -702,6 +710,8 @@ impl Client {
                         self.dri3_qe_resp_seq = Some(self.seq_no);
                     } else if name == "SYNC" {
                         self.sync_qe_resp_seq = Some(self.seq_no)
+                    } else if name == "Present" {
+                        self.present_qe_resp_seq = Some(self.seq_no);
                     }
                 } else if Some(buf[ptr]) == self.dri3_ext_opcode {
                     if buf[ptr + 1] == DRI3_OPCODE_OPEN {
@@ -716,19 +726,50 @@ impl Client {
                         let cmsgs = [ControlMessage::ScmRights(&fds)];
                         sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(&reply)], &cmsgs, MsgFlags::empty(), None)?;
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFER {
+                        let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
+                        fd_xids[cur_fd_for_msg] = Some(xid);
                         cur_fd_for_msg += 1;
                     } else if buf[ptr + 1] == DRI3_OPCODE_FENCE_FROM_FD {
                         let xid = u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
                         fd_xids[cur_fd_for_msg] = Some(xid);
                         cur_fd_for_msg += 1;
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFERS {
-                        cur_fd_for_msg += buf[ptr + 12] as usize;
+                        let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
+                        let num_bufs = buf[ptr + 12] as usize;
+                        for i in 0..num_bufs {
+                            fd_xids[cur_fd_for_msg + i] = Some(xid);
+                        }
+                        cur_fd_for_msg += num_bufs;
                     }
                 } else if Some(buf[ptr]) == self.sync_ext_opcode {
                     if buf[ptr + 1] == SYNC_OPCODE_DESTROY_FENCE {
                         let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
                         fences_to_destroy.push(xid);
                     }
+                } else if Some(buf[ptr]) == self.present_ext_opcode {
+                    if buf[ptr + 1] == PRESENT_OPCODE_PRESENT_PIXMAP {
+                        let xid = u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
+                        let ep = Epoll::new(EpollCreateFlags::empty()).unwrap();
+                        let bufs = &self.buffers_for_pixmap[&xid];
+                        let mut remaining = bufs.len();
+                        for buf in bufs {
+                            ep.add(buf, EpollEvent::new(EpollFlags::EPOLLIN, buf.as_raw_fd() as u64)).unwrap();
+                        }
+                        let mut events = vec![EpollEvent::empty(); remaining];
+                        while remaining != 0 {
+                            let processed = match ep.wait(&mut events, EpollTimeout::NONE) {
+                                Err(Errno::EINTR) => 0,
+                                e => e.unwrap()
+                            };
+                            for e in &events[0..processed] {
+                                ep.delete(unsafe { BorrowedFd::borrow_raw(e.data() as RawFd) }).unwrap();
+                            }
+                            remaining -= processed;
+                        }
+                    }
+                } else if buf[ptr] == X11_OPCODE_FREE_PIXMAP {
+                    let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
+                    self.buffers_for_pixmap.remove(&xid);
                 }
                 self.seq_no = self.seq_no.wrapping_add(1);
                 let req_len = u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
@@ -742,14 +783,16 @@ impl Client {
         ring_msg.hdr.cmd_size = size as u16;
         ring_msg.num_identifiers = fds.len() as u32;
         let mut gem_handles = Vec::with_capacity(fds.len());
-        for (i, fd) in fds.iter().enumerate() {
-            let res = self.vgpu_id_from_prime(&mut ring_msg, i, fd.as_raw_fd());
-            if let Ok(gh) = res {
+        for (i, fd) in fds.into_iter().enumerate() {
+            let filename = readlink(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str())?;
+            let filename = filename.to_string_lossy();
+            if filename.starts_with("/dmabuf:") {
+                let gh = self.vgpu_id_from_prime(&mut ring_msg, i, &fd_xids, fd)?;
                 gem_handles.push(gh);
                 continue;
             }
             let creds = getsockopt(&self.socket.as_fd(), PeerCredentials)?;
-            self.create_cross_vm_futex(&mut ring_msg, i, fd, &fd_xids, creds.pid())?;
+            self.create_cross_vm_futex(&mut ring_msg, i, fd, &fd_xids, creds.pid(), filename)?;
         }
         self.gpu_ctx.submit_cmd(&ring_msg, size, None, None)?;
         for gem_handle in gem_handles {
@@ -770,14 +813,15 @@ impl Client {
         }
         Ok(false)
     }
-    fn vgpu_id_from_prime<T>(&self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd: RawFd) -> Result<u32> {
+    fn vgpu_id_from_prime<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd_xids: &[Option<u32>], fd: OwnedFd) -> Result<u32> {
         let mut to_handle = DrmPrimeHandle {
-            fd,
+            fd: fd.as_raw_fd(),
             ..DrmPrimeHandle::default()
         };
         unsafe {
             drm_prime_fd_to_handle(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_handle)?;
         }
+        self.buffers_for_pixmap.entry(fd_xids[i].unwrap()).or_default().push(fd);
         let mut res_info = DrmVirtgpuResourceInfo {
             bo_handle: to_handle.handle,
             ..DrmVirtgpuResourceInfo::default()
@@ -841,16 +885,15 @@ impl Client {
         kill(pid, Signal::SIGCONT)?;
         Ok(())
     }
-    fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: &OwnedFd, fd_xids: &[Option<u32>], pid: pid_t) -> Result<()> {
-        let name = readlink(format!("/proc/self/fd/{}", memfd.as_raw_fd()).as_str())?;
+    fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: OwnedFd, fd_xids: &[Option<u32>], pid: pid_t, filename: Cow<'_, str>) -> Result<()> {
         let mut shmem_file;
         let mut shmem_name;
-        if name.to_string_lossy().starts_with(util::SHM_PREFIX) {
+        if filename.starts_with(util::SHM_PREFIX) {
             shmem_name = [0; 8];
             for i in 0..8 {
-                shmem_name[i] = name.as_bytes()[i + util::SHM_PREFIX.len()];
+                shmem_name[i] = filename.as_bytes()[i + util::SHM_PREFIX.len()];
             }
-            shmem_file = File::from(memfd.try_clone().unwrap());
+            shmem_file = File::from(memfd);
         } else {
             (shmem_name, shmem_file) = util::create_shm_file()?;
             let mut shmem_path = util::SHM_PREFIX.to_owned();
@@ -953,6 +996,9 @@ impl Client {
                 } else if Some(seq_no) == self.sync_qe_resp_seq {
                     self.sync_qe_resp_seq = None;
                     self.sync_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
+                } else if Some(seq_no) == self.present_qe_resp_seq {
+                    self.present_qe_resp_seq = None;
+                    self.present_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
                 }
             }
             ptr += len;
