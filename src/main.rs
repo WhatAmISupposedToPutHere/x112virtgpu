@@ -741,15 +741,23 @@ impl Client {
         ring_msg.opaque_data_size = buf.len() as u32;
         ring_msg.hdr.cmd_size = size as u16;
         ring_msg.num_identifiers = fds.len() as u32;
+        let mut gem_handles = Vec::with_capacity(fds.len());
         for (i, fd) in fds.iter().enumerate() {
             let res = self.vgpu_id_from_prime(&mut ring_msg, i, fd.as_raw_fd());
-            if res.is_ok() {
+            if let Ok(gh) = res {
+                gem_handles.push(gh);
                 continue;
             }
             let creds = getsockopt(&self.socket.as_fd(), PeerCredentials)?;
             self.create_cross_vm_futex(&mut ring_msg, i, fd, &fd_xids, creds.pid())?;
         }
         self.gpu_ctx.submit_cmd(&ring_msg, size, None, None)?;
+        for gem_handle in gem_handles {
+            unsafe {
+                let close = DrmGemClose::new(gem_handle);
+                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close).unwrap();
+            }
+        }
         for xid in fences_to_destroy {
             self.futex_watchers.remove(&xid).unwrap();
             let ft_destroy_msg_size = mem::size_of::<CrossDomainFutexDestroy>();
@@ -762,7 +770,7 @@ impl Client {
         }
         Ok(false)
     }
-    fn vgpu_id_from_prime<T>(&self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd: RawFd) -> Result<()> {
+    fn vgpu_id_from_prime<T>(&self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd: RawFd) -> Result<u32> {
         let mut to_handle = DrmPrimeHandle {
             fd,
             ..DrmPrimeHandle::default()
@@ -779,7 +787,7 @@ impl Client {
         }
         ring_msg.identifiers[i] = res_info.res_handle;
         ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB;
-        Ok(())
+        Ok(to_handle.handle)
     }
 
     fn replace_futex_storage(my_fd: RawFd, pid: Pid, shmem_path: &str) -> Result<()> {
@@ -894,7 +902,8 @@ impl Client {
         self.gpu_ctx.poll_cmd()
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
-        let mut fds = Vec::with_capacity(recv.num_identifiers as usize);
+        let mut raw_fds = Vec::with_capacity(recv.num_identifiers as usize);
+        let mut owned_fds = Vec::with_capacity(recv.num_identifiers as usize);
         for i in 0..recv.num_identifiers as usize {
             assert_eq!(recv.identifier_types[i], CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB);
             let mut create_blob = DrmVirtgpuResourceCreateBlob {
@@ -914,8 +923,13 @@ impl Client {
             };
             unsafe {
                 drm_prime_handle_to_fd(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_fd)?;
+                let close = DrmGemClose::new(create_blob.bo_handle);
+                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close).unwrap();
             }
-            fds.push(RawFd::from(to_fd.fd));
+            raw_fds.push(RawFd::from(to_fd.fd));
+            unsafe {
+                owned_fds.push(OwnedFd::from_raw_fd(raw_fds[i]))
+            }
         }
         let data = &recv.data[..(recv.opaque_data_size as usize)];
         self.debug_loop.loop_remote(data);
@@ -947,7 +961,7 @@ impl Client {
         let cmsgs = if recv.num_identifiers == 0 {
             Vec::new()
         } else {
-            vec![ControlMessage::ScmRights(&fds)]
+            vec![ControlMessage::ScmRights(&raw_fds)]
         };
         sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(data)], &cmsgs, MsgFlags::empty(), None)?;
         Ok(())
