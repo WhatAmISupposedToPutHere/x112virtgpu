@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::ErrorKind;
 use rand::Rng;
 
-pub const SHM_PREFIX: &'static str = "/dev/shm/shm-";
+pub const SHM_PREFIX: &'static str = "/dev/shm/krshm-";
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 

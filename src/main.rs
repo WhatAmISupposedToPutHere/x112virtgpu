@@ -21,7 +21,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 use anyhow::Result;
 use nix::errno::Errno;
 use nix::fcntl::readlink;
-use nix::unistd::{Pid, read};
+use nix::unistd::{getresgid, getresuid, Pid, read, setegid, seteuid};
 use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
 use nix::sys::ptrace;
 use nix::sys::ptrace::Options;
@@ -798,7 +798,7 @@ impl Client {
         for gem_handle in gem_handles {
             unsafe {
                 let close = DrmGemClose::new(gem_handle);
-                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close).unwrap();
+                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close)?;
             }
         }
         for xid in fences_to_destroy {
@@ -967,7 +967,7 @@ impl Client {
             unsafe {
                 drm_prime_handle_to_fd(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_fd)?;
                 let close = DrmGemClose::new(create_blob.bo_handle);
-                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close).unwrap();
+                drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close)?;
             }
             raw_fds.push(RawFd::from(to_fd.fd));
             unsafe {
@@ -1018,7 +1018,21 @@ fn main() {
     let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
     let sock_path = "/tmp/.X11-unix/X0";
     _ = fs::remove_file(&sock_path);
+    let resuid = getresuid().unwrap();
+    let resgid = getresgid().unwrap();
+    if resuid.real != resuid.effective {
+        seteuid(resuid.real).unwrap();
+    }
+    if resgid.real != resgid.effective {
+        setegid(resgid.real).unwrap()
+    }
     let listen_sock = UnixListener::bind(sock_path).unwrap();
+    if resuid.real != resuid.effective {
+        seteuid(resuid.effective).unwrap();
+    }
+    if resgid.real != resgid.effective {
+        setegid(resgid.effective).unwrap()
+    }
     epoll.add(&listen_sock, EpollEvent::new(EpollFlags::EPOLLIN, listen_sock.as_raw_fd() as u64)).unwrap();
     let mut client_sock = HashMap::<u64, Rc<RefCell<Client>>>::new();
     let mut client_vgpu = HashMap::<u64, Rc<RefCell<Client>>>::new();
