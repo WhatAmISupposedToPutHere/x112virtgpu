@@ -47,6 +47,7 @@ const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x90000000;
 const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
 const CROSS_DOMAIN_ID_TYPE_SHM: u32 = 5;
 
+const X11_OPCODE_CREATE_PIXMAP: u8 = 53;
 const X11_OPCODE_FREE_PIXMAP: u8 = 54;
 const X11_OPCODE_QUERY_EXTENSION: u8 = 98;
 const X11_OPCODE_NOP: u8 = 127;
@@ -767,6 +768,9 @@ impl Client {
                             remaining -= processed;
                         }
                     }
+                } else if buf[ptr] == X11_OPCODE_CREATE_PIXMAP {
+                    let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
+                    self.buffers_for_pixmap.insert(xid, Vec::new());
                 } else if buf[ptr] == X11_OPCODE_FREE_PIXMAP {
                     let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
                     self.buffers_for_pixmap.remove(&xid);
