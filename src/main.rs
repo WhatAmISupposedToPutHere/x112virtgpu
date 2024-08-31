@@ -52,6 +52,7 @@ const X11_OPCODE_FREE_PIXMAP: u8 = 54;
 const X11_OPCODE_QUERY_EXTENSION: u8 = 98;
 const X11_OPCODE_NOP: u8 = 127;
 const X11_REPLY: u8 = 1;
+const X11_GENERIC_EVENT: u8 = 35;
 const DRI3_OPCODE_OPEN: u8 = 1;
 const DRI3_OPCODE_PIXMAP_FROM_BUFFER: u8 = 2;
 const DRI3_OPCODE_FENCE_FROM_FD: u8 = 4;
@@ -776,7 +777,10 @@ impl Client {
                     self.buffers_for_pixmap.remove(&xid);
                 }
                 self.seq_no = self.seq_no.wrapping_add(1);
-                let req_len = u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
+                let mut req_len = u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
+                if req_len == 0 {
+                    req_len = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap()) as usize * 4;
+                }
                 ptr += req_len;
             }
             self.request_tail = ptr - buf.len();
@@ -988,7 +992,8 @@ impl Client {
         while ptr < data.len() {
             let seq_no = u16::from_ne_bytes(data[(ptr + 2)..(ptr + 4)].try_into().unwrap());
             let is_reply = data[ptr] == X11_REPLY;
-            let len = if is_reply {
+            let is_generic = data[ptr] == X11_GENERIC_EVENT;
+            let len = if is_reply || is_generic {
                 u32::from_ne_bytes(data[(ptr + 4)..(ptr + 8)].try_into().unwrap()) as usize * 4
             } else {
                 0
