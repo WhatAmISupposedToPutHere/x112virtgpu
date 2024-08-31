@@ -1080,13 +1080,25 @@ fn main() {
                 let client = client.borrow();
                 let gpu_fd = client.gpu_ctx.fd.as_fd();
                 epoll.delete(gpu_fd).unwrap();
-                client_vgpu.remove(&(gpu_fd.as_raw_fd() as u64));
                 epoll.delete(&client.socket).unwrap();
+                let gpu_fd = gpu_fd.as_raw_fd() as u64;
                 drop(client);
+                client_vgpu.remove(&gpu_fd);
                 client_sock.remove(&fd);
             }
         } else if let Some(client) = client_vgpu.get_mut(&fd) {
-            client.borrow_mut().process_vgpu().unwrap();
+            let res = client.borrow_mut().process_vgpu();
+            if let Err(e) = res {
+                eprintln!("Client disconnected with error: {:?}", e);
+                let client = client.borrow();
+                let gpu_fd = client.gpu_ctx.fd.as_fd();
+                epoll.delete(gpu_fd).unwrap();
+                let gpu_fd = gpu_fd.as_raw_fd() as u64;
+                epoll.delete(&client.socket).unwrap();
+                drop(client);
+                client_vgpu.remove(&gpu_fd);
+                client_sock.remove(&fd);
+            }
         }
     }
 }
