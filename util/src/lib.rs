@@ -1,6 +1,6 @@
+use rand::Rng;
 use std::fs::File;
 use std::io::ErrorKind;
-use rand::Rng;
 
 pub const SHM_PREFIX: &'static str = "/dev/shm/krshm-";
 
@@ -14,14 +14,20 @@ pub fn create_shm_file() -> Result<([u8; 8], File)> {
         for c in shmem_name {
             shmem_path.push(c as char);
         }
-        let result = File::options().read(true).write(true).create_new(true).open(&shmem_path);
+        let result = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&shmem_path);
         match result {
             Ok(file) => {
                 file.set_len(4)?;
-                return Ok((shmem_name, file))
-            },
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {},
-            e => { e?; },
+                return Ok((shmem_name, file));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            e => {
+                e?;
+            }
         }
-    };
+    }
 }
