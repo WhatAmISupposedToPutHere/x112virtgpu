@@ -11,13 +11,13 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::ptrace;
 use nix::sys::ptrace::Options;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::Signal;
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::socket::{
     getsockopt, recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg,
 };
 use nix::sys::stat::fstat;
-use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
+use nix::sys::uio::{process_vm_writev, RemoteIoVec};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getresgid, getresuid, read, setegid, seteuid, Pid};
 use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
@@ -35,7 +35,7 @@ use std::process::exit;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{env, fs, mem, ptr, slice, thread};
@@ -67,6 +67,9 @@ const DRI3_OPCODE_FENCE_FROM_FD: u8 = 4;
 const SYNC_OPCODE_DESTROY_FENCE: u8 = 17;
 const DRI3_OPCODE_PIXMAP_FROM_BUFFERS: u8 = 7;
 const PRESENT_OPCODE_PRESENT_PIXMAP: u8 = 1;
+
+const SYSCALL_INSTR: u32 = 0xd4000001;
+static SYSCALL_OFFSET: OnceLock<usize> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Default)]
@@ -617,7 +620,7 @@ impl Drop for FutexWatcherThread {
 
 struct RemoteCaller {
     pid: Pid,
-    old_regs: user_regs_struct,
+    regs: user_regs_struct,
 }
 
 impl RemoteCaller {
@@ -626,36 +629,15 @@ impl RemoteCaller {
         F: FnOnce(&RemoteCaller) -> Result<R>,
     {
         let old_regs = ptrace::getregs(pid)?;
-        {
-            // Writing to a dax-backed shared page via ptrace is broken, and causes everything except
-            // for the address to be filled with zeroes.
-            // Force the page to become private and restore its contents.
-            let mut page = vec![0; PAGE_SIZE];
-            let aligned_addr = old_regs.pc as usize & !(PAGE_SIZE - 1);
-            process_vm_readv(
-                pid,
-                &mut [IoSliceMut::new(&mut page)],
-                &[RemoteIoVec {
-                    base: aligned_addr,
-                    len: PAGE_SIZE,
-                }],
-            )?;
-            for i in 0..(PAGE_SIZE / 8) {
-                let offset = i * 8;
-                let val = i64::from_ne_bytes(page[offset..(offset + 8)].try_into().unwrap());
-                ptrace::write(pid, (aligned_addr + offset) as *mut c_void, val)?;
-            }
-            /*
-            process_vm_writev(pid, &[IoSlice::new(&page)], &[RemoteIoVec {
-                base: aligned_addr,
-                len: PAGE_SIZE
-            }])?;
-            */
-        }
-        let old_instr = ptrace::read(pid, old_regs.pc as *mut c_void)?;
-        ptrace::write(pid, old_regs.pc as *mut c_void, 0xd4000001u64 as i64)?;
-        let res = f(&RemoteCaller { old_regs, pid })?;
-        ptrace::write(pid, old_regs.pc as *mut c_void, old_instr)?;
+
+        // Find the vDSO and the address of a syscall instruction within it
+        let (vdso_start, _) = find_vdso(Some(pid))?;
+        let syscall_addr = vdso_start + SYSCALL_OFFSET.get().unwrap();
+
+        let mut regs = old_regs;
+        regs.pc = syscall_addr as u64;
+        ptrace::setregs(pid, regs)?;
+        let res = f(&RemoteCaller { regs, pid })?;
         ptrace::setregs(pid, old_regs)?;
         Ok(res)
     }
@@ -708,7 +690,7 @@ impl RemoteCaller {
         .map(|x| x as i32)
     }
     fn syscall(&self, syscall_no: c_long, args: [c_ulonglong; 6]) -> Result<c_ulonglong> {
-        let mut regs = self.old_regs;
+        let mut regs = self.regs;
         for i in 0..6 {
             regs.regs[i] = args[i];
         }
@@ -1216,6 +1198,26 @@ struct Args {
     listen_display: String,
 }
 
+fn find_vdso(pid: Option<Pid>) -> Result<(usize, usize), Errno> {
+    let path = format!(
+        "/proc/{}/maps",
+        pid.map(|a| a.to_string()).unwrap_or("self".into())
+    );
+
+    for line in read_to_string(path).unwrap().lines() {
+        if line.ends_with("[vdso]") {
+            let a = line.find("-").ok_or(Errno::EINVAL)?;
+            let b = line.find(" ").ok_or(Errno::EINVAL)?;
+            let start = usize::from_str_radix(&line[..a], 16).or(Err(Errno::EINVAL))?;
+            let end = usize::from_str_radix(&line[a + 1..b], 16).or(Err(Errno::EINVAL))?;
+
+            return Ok((start, end));
+        }
+    }
+
+    Err(Errno::EINVAL)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -1231,6 +1233,23 @@ fn main() {
         eprintln!("Invalid --listen-display value");
         exit(1)
     };
+
+    // Look for a syscall instruction in the vDSO. We assume all processes map
+    // the same vDSO (which should be true if they are running under the same
+    // kernel!)
+    let (vdso_start, vdso_end) = find_vdso(None).unwrap();
+    for off in (0..(vdso_end - vdso_start)).step_by(4) {
+        let addr = vdso_start + off;
+        let val = unsafe { std::ptr::read(addr as *const u32) };
+        if val == SYSCALL_INSTR {
+            SYSCALL_OFFSET.set(off).unwrap();
+            break;
+        }
+    }
+    if SYSCALL_OFFSET.get().is_none() {
+        eprintln!("Failed to find syscall instruction in vDSO");
+        exit(1);
+    }
 
     let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
     _ = fs::remove_file(&sock_path);
