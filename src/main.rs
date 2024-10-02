@@ -1,6 +1,27 @@
-use std::{env, fs, mem, ptr, slice, thread};
+use anyhow::Result;
+use nix::errno::Errno;
+use nix::fcntl::readlink;
+use nix::libc::{
+    c_int, c_ulonglong, c_void, off_t, pid_t, user_regs_struct, SYS_close, SYS_dup3, SYS_mmap,
+    SYS_munmap, SYS_openat, AT_FDCWD, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, O_CLOEXEC,
+    O_RDWR, PROT_READ, PROT_WRITE, PTRACE_EVENT_STOP,
+};
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::sys::ptrace;
+use nix::sys::ptrace::Options;
+use nix::sys::signal::{kill, Signal};
+use nix::sys::socket::sockopt::PeerCredentials;
+use nix::sys::socket::{
+    getsockopt, recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg,
+};
+use nix::sys::stat::fstat;
+use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{getresgid, getresuid, read, setegid, seteuid, Pid};
+use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
 use std::borrow::Cow;
-use std::cell::{RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
 use std::fs::File;
@@ -9,28 +30,13 @@ use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::ptr::{NonNull};
+use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
-use nix::libc::{c_int, off_t, c_void, O_RDWR, pid_t, c_ulonglong, user_regs_struct, SYS_dup3, SYS_close, SYS_mmap, SYS_munmap, SYS_openat, AT_FDCWD, PTRACE_EVENT_STOP, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, O_CLOEXEC, MAP_SHARED, MAP_FIXED};
-use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
-use anyhow::Result;
-use nix::errno::Errno;
-use nix::fcntl::readlink;
-use nix::unistd::{getresgid, getresuid, Pid, read, setegid, seteuid};
-use nix::sys::mman::{MapFlags, mmap, munmap, ProtFlags};
-use nix::sys::ptrace;
-use nix::sys::ptrace::Options;
-use nix::sys::signal::{kill, Signal};
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, getsockopt, MsgFlags, recvmsg, RecvMsg, sendmsg};
-use nix::sys::socket::sockopt::PeerCredentials;
-use nix::sys::stat::fstat;
-use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use std::{env, fs, mem, ptr, slice, thread};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -75,7 +81,12 @@ struct DrmVirtgpuContextSetParam {
     value: u64,
 }
 
-ioctl_readwrite!(drm_virtgpu_context_init, 'd', 0x40 + 0xb, DrmVirtgpuContextInit);
+ioctl_readwrite!(
+    drm_virtgpu_context_init,
+    'd',
+    0x40 + 0xb,
+    DrmVirtgpuContextInit
+);
 
 #[repr(C)]
 #[derive(Default)]
@@ -88,17 +99,22 @@ struct DrmVirtgpuResourceCreateBlob {
     pad: u32,
     cmd_size: u32,
     cmd: u64,
-    blob_id: u64
+    blob_id: u64,
 }
 
-ioctl_readwrite!(drm_virtgpu_resource_create_blob, 'd', 0x40 + 0xa, DrmVirtgpuResourceCreateBlob);
+ioctl_readwrite!(
+    drm_virtgpu_resource_create_blob,
+    'd',
+    0x40 + 0xa,
+    DrmVirtgpuResourceCreateBlob
+);
 
 #[repr(C)]
 #[derive(Default)]
 struct DrmVirtgpuMap {
     offset: u64,
     handle: u32,
-    pad: u32
+    pad: u32,
 }
 
 ioctl_readwrite!(drm_virtgpu_map, 'd', 0x40 + 0x1, DrmVirtgpuMap);
@@ -107,7 +123,7 @@ ioctl_readwrite!(drm_virtgpu_map, 'd', 0x40 + 0x1, DrmVirtgpuMap);
 #[derive(Default)]
 struct DrmGemClose {
     handle: u32,
-    pad: u32
+    pad: u32,
 }
 
 impl DrmGemClose {
@@ -126,7 +142,7 @@ ioctl_write_ptr!(drm_gem_close, 'd', 0x9, DrmGemClose);
 struct DrmPrimeHandle {
     handle: u32,
     flags: u32,
-    fd: i32
+    fd: i32,
 }
 
 ioctl_readwrite!(drm_prime_handle_to_fd, 'd', 0x2d, DrmPrimeHandle);
@@ -136,7 +152,7 @@ ioctl_readwrite!(drm_prime_fd_to_handle, 'd', 0x2e, DrmPrimeHandle);
 #[derive(Default)]
 struct DrmEvent {
     ty: u32,
-    length: u32
+    length: u32,
 }
 
 const VIRTGPU_EXECBUF_RING_IDX: u32 = 0x04;
@@ -150,10 +166,15 @@ struct DrmVirtgpuExecbuffer {
     num_bo_handles: u32,
     fence_fd: i32,
     ring_idx: u32,
-    pad: u32
+    pad: u32,
 }
 
-ioctl_readwrite!(drm_virtgpu_execbuffer, 'd', 0x40 + 0x2, DrmVirtgpuExecbuffer);
+ioctl_readwrite!(
+    drm_virtgpu_execbuffer,
+    'd',
+    0x40 + 0x2,
+    DrmVirtgpuExecbuffer
+);
 
 #[repr(C)]
 #[derive(Default)]
@@ -161,10 +182,15 @@ struct DrmVirtgpuResourceInfo {
     bo_handle: u32,
     res_handle: u32,
     size: u32,
-    blob_mem: u32
+    blob_mem: u32,
 }
 
-ioctl_readwrite!(drm_virtgpu_resource_info, 'd', 0x40 + 0x5, DrmVirtgpuResourceInfo);
+ioctl_readwrite!(
+    drm_virtgpu_resource_info,
+    'd',
+    0x40 + 0x5,
+    DrmVirtgpuResourceInfo
+);
 
 #[repr(C)]
 #[derive(Default)]
@@ -172,13 +198,14 @@ struct CrossDomainHeader {
     cmd: u8,
     fence_ctx_idx: u8,
     cmd_size: u16,
-    pad: u32
+    pad: u32,
 }
 
 impl CrossDomainHeader {
     fn new(cmd: u8, cmd_size: u16) -> CrossDomainHeader {
         CrossDomainHeader {
-            cmd, cmd_size,
+            cmd,
+            cmd_size,
             ..CrossDomainHeader::default()
         }
     }
@@ -193,20 +220,23 @@ struct CrossDomainInit {
     hdr: CrossDomainHeader,
     query_ring_id: u32,
     channel_ring_id: u32,
-    channel_type: u32
+    channel_type: u32,
 }
 
 #[repr(C)]
 #[derive(Default)]
 struct CrossDomainPoll {
     hdr: CrossDomainHeader,
-    pad: u64
+    pad: u64,
 }
 
 impl CrossDomainPoll {
     fn new() -> CrossDomainPoll {
         CrossDomainPoll {
-            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_POLL, mem::size_of::<CrossDomainPoll>() as u16),
+            hdr: CrossDomainHeader::new(
+                CROSS_DOMAIN_CMD_POLL,
+                mem::size_of::<CrossDomainPoll>() as u16,
+            ),
             ..CrossDomainPoll::default()
         }
     }
@@ -249,7 +279,7 @@ struct CrossDomainSendReceive<T: ?Sized> {
     identifiers: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
     identifier_types: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
     identifier_sizes: [u32; CROSS_DOMAIN_MAX_IDENTIFIERS],
-    data: T
+    data: T,
 }
 
 const CROSS_DOMAIN_SR_TAIL_SIZE: usize = PAGE_SIZE - mem::size_of::<CrossDomainSendReceive<()>>();
@@ -282,16 +312,20 @@ impl GpuRing {
         }
         let ptr = unsafe {
             mmap(
-                None, NonZeroUsize::new(PAGE_SIZE).unwrap(),
+                None,
+                NonZeroUsize::new(PAGE_SIZE).unwrap(),
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_SHARED, &fd, map.offset as off_t
-            )?.as_ptr()
+                MapFlags::MAP_SHARED,
+                &fd,
+                map.offset as off_t,
+            )?
+            .as_ptr()
         };
         Ok(GpuRing {
             fd,
             handle: create_blob.bo_handle,
             res_id: create_blob.res_handle,
-            address: ptr
+            address: ptr,
         })
     }
 }
@@ -309,7 +343,7 @@ impl Drop for GpuRing {
 struct Context {
     fd: OwnedFd,
     channel_ring: GpuRing,
-    query_ring: GpuRing
+    query_ring: GpuRing,
 }
 
 impl Context {
@@ -317,23 +351,27 @@ impl Context {
         let mut params = [
             DrmVirtgpuContextSetParam {
                 param: VIRTGPU_CONTEXT_PARAM_CAPSET_ID,
-                value: CAPSET_CROSS_DOMAIN
+                value: CAPSET_CROSS_DOMAIN,
             },
             DrmVirtgpuContextSetParam {
                 param: VIRTGPU_CONTEXT_PARAM_NUM_RINGS,
-                value: 2
+                value: 2,
             },
             DrmVirtgpuContextSetParam {
                 param: VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK,
-                value: 1 << CROSS_DOMAIN_CHANNEL_RING
-            }
+                value: 1 << CROSS_DOMAIN_CHANNEL_RING,
+            },
         ];
         let mut init = DrmVirtgpuContextInit {
             num_params: 3,
             pad: 0,
-            ctx_set_params: params.as_mut_ptr() as u64
+            ctx_set_params: params.as_mut_ptr() as u64,
         };
-        let fd: OwnedFd = File::options().write(true).read(true).open("/dev/dri/renderD128")?.into();
+        let fd: OwnedFd = File::options()
+            .write(true)
+            .read(true)
+            .open("/dev/dri/renderD128")?
+            .into();
         unsafe {
             drm_virtgpu_context_init(fd.as_raw_fd() as c_int, &mut init)?;
         }
@@ -341,10 +379,15 @@ impl Context {
         let query_ring = GpuRing::new(&fd)?;
         let channel_ring = GpuRing::new(&fd)?;
         let this = Context {
-            fd, query_ring, channel_ring
+            fd,
+            query_ring,
+            channel_ring,
         };
         let init_cmd = CrossDomainInit {
-            hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_INIT, mem::size_of::<CrossDomainInit>() as u16),
+            hdr: CrossDomainHeader::new(
+                CROSS_DOMAIN_CMD_INIT,
+                mem::size_of::<CrossDomainInit>() as u16,
+            ),
             query_ring_id: this.query_ring.res_id,
             channel_ring_id: this.channel_ring.res_id,
             channel_type: CROSS_DOMAIN_CHANNEL_TYPE_X11,
@@ -353,16 +396,39 @@ impl Context {
         this.poll_cmd()?;
         Ok(this)
     }
-    fn submit_cmd<T>(&self, cmd: &T, cmd_size: usize, ring_idx: Option<u32>, ring_handle: Option<u32>) -> Result<()> {
-        submit_cmd_raw(self.fd.as_raw_fd() as c_int, cmd, cmd_size, ring_idx, ring_handle)
+    fn submit_cmd<T>(
+        &self,
+        cmd: &T,
+        cmd_size: usize,
+        ring_idx: Option<u32>,
+        ring_handle: Option<u32>,
+    ) -> Result<()> {
+        submit_cmd_raw(
+            self.fd.as_raw_fd() as c_int,
+            cmd,
+            cmd_size,
+            ring_idx,
+            ring_handle,
+        )
     }
     fn poll_cmd(&self) -> Result<()> {
         let cmd = CrossDomainPoll::new();
-        self.submit_cmd(&cmd, mem::size_of::<CrossDomainPoll>(), Some(CROSS_DOMAIN_CHANNEL_RING), None)
+        self.submit_cmd(
+            &cmd,
+            mem::size_of::<CrossDomainPoll>(),
+            Some(CROSS_DOMAIN_CHANNEL_RING),
+            None,
+        )
     }
 }
 
-fn submit_cmd_raw<T>(fd: c_int, cmd: &T, cmd_size: usize, ring_idx: Option<u32>, ring_handle: Option<u32>) -> Result<()> {
+fn submit_cmd_raw<T>(
+    fd: c_int,
+    cmd: &T,
+    cmd_size: usize,
+    ring_idx: Option<u32>,
+    ring_handle: Option<u32>,
+) -> Result<()> {
     let cmd_buf = cmd as *const T as *const u8;
     let mut exec = DrmVirtgpuExecbuffer {
         command: cmd_buf as u64,
@@ -396,7 +462,10 @@ struct DebugLoop(Option<DebugLoopInner>);
 
 impl DebugLoop {
     fn new() -> DebugLoop {
-        if !env::var("X11VG_DEBUG").map(|x| x == "1").unwrap_or_default() {
+        if !env::var("X11VG_DEBUG")
+            .map(|x| x == "1")
+            .unwrap_or_default()
+        {
             return DebugLoop(None);
         }
         let ls_remote_l = TcpListener::bind(("0.0.0.0", 6001)).unwrap();
@@ -404,7 +473,8 @@ impl DebugLoop {
         let ls_remote = ls_remote_l.accept().unwrap().0;
         let ls_local = ls_local_jh.join().unwrap();
         DebugLoop(Some(DebugLoopInner {
-            ls_remote, ls_local
+            ls_remote,
+            ls_local,
         }))
     }
     fn loop_remote(&mut self, data: &[u8]) {
@@ -440,7 +510,7 @@ struct Client {
     reply_tail: usize,
     request_tail: usize,
     debug_loop: DebugLoop,
-    buffers_for_pixmap: HashMap<u32, Vec<OwnedFd>>
+    buffers_for_pixmap: HashMap<u32, Vec<OwnedFd>>,
 }
 
 #[derive(Clone)]
@@ -468,7 +538,7 @@ struct FutexWatcherThread {
     join_handle: Option<JoinHandle<()>>,
     join_handle2: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    futex: FutexPtr
+    futex: FutexPtr,
 }
 
 unsafe fn wake_futex(futex: *mut c_void, val3: u32) {
@@ -506,22 +576,31 @@ impl FutexWatcherThread {
             let timeout = ptr::null::<()>();
             let uaddr2 = ptr::null::<()>();
             let val3 = 1u32;
-            let atomic_val = unsafe {
-                AtomicU32::from_ptr(uaddr.0 as *mut u32)
-            };
+            let atomic_val = unsafe { AtomicU32::from_ptr(uaddr.0 as *mut u32) };
             loop {
                 if shutdown3.load(Ordering::SeqCst) {
                     break;
                 }
                 let val = atomic_val.load(Ordering::SeqCst);
                 unsafe {
-                    nix::libc::syscall(nix::libc::SYS_futex, uaddr.0, op, val, timeout, uaddr2, val3);
+                    nix::libc::syscall(
+                        nix::libc::SYS_futex,
+                        uaddr.0,
+                        op,
+                        val,
+                        timeout,
+                        uaddr2,
+                        val3,
+                    );
                 }
                 let ft_signal_msg_size = mem::size_of::<CrossDomainFutexSignal>();
                 let ft_signal_cmd = CrossDomainFutexSignal {
-                    hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_SIGNAL, ft_signal_msg_size as u16),
+                    hdr: CrossDomainHeader::new(
+                        CROSS_DOMAIN_CMD_FUTEX_SIGNAL,
+                        ft_signal_msg_size as u16,
+                    ),
                     id: xid,
-                    pad: 0
+                    pad: 0,
                 };
                 submit_cmd_raw(fd, &ft_signal_cmd, ft_signal_msg_size, None, None).unwrap();
             }
@@ -530,7 +609,7 @@ impl FutexWatcherThread {
             futex,
             join_handle: Some(handle),
             join_handle2: Some(handle2),
-            shutdown: shutdown2
+            shutdown: shutdown2,
         }
     }
 }
@@ -552,7 +631,10 @@ struct RemoteCaller {
 }
 
 impl RemoteCaller {
-    fn with<R, F>(pid: Pid, f: F) -> Result<R> where F: FnOnce(&RemoteCaller) -> Result<R> {
+    fn with<R, F>(pid: Pid, f: F) -> Result<R>
+    where
+        F: FnOnce(&RemoteCaller) -> Result<R>,
+    {
         let old_regs = ptrace::getregs(pid)?;
         {
             // Writing to a dax-backed shared page via ptrace is broken, and causes everything except
@@ -560,10 +642,14 @@ impl RemoteCaller {
             // Force the page to become private and restore its contents.
             let mut page = vec![0; PAGE_SIZE];
             let aligned_addr = old_regs.pc as usize & !(PAGE_SIZE - 1);
-            process_vm_readv(pid, &mut [IoSliceMut::new(&mut page)], &[RemoteIoVec {
-                base: aligned_addr,
-                len: PAGE_SIZE
-            }])?;
+            process_vm_readv(
+                pid,
+                &mut [IoSliceMut::new(&mut page)],
+                &[RemoteIoVec {
+                    base: aligned_addr,
+                    len: PAGE_SIZE,
+                }],
+            )?;
             for i in 0..(PAGE_SIZE / 8) {
                 let offset = i * 8;
                 let val = i64::from_ne_bytes(page[offset..(offset + 8)].try_into().unwrap());
@@ -578,33 +664,58 @@ impl RemoteCaller {
         }
         let old_instr = ptrace::read(pid, old_regs.pc as *mut c_void)?;
         ptrace::write(pid, old_regs.pc as *mut c_void, 0xd4000001u64 as i64)?;
-        let res = f(&RemoteCaller {
-            old_regs, pid
-        })?;
+        let res = f(&RemoteCaller { old_regs, pid })?;
         ptrace::write(pid, old_regs.pc as *mut c_void, old_instr)?;
         ptrace::setregs(pid, old_regs)?;
         Ok(res)
     }
     fn dup2(&self, oldfd: i32, newfd: i32) -> Result<i32> {
-        self.syscall(SYS_dup3, [oldfd as u64, newfd as u64, 0, 0, 0, 0]).map(|x| x as i32)
+        self.syscall(SYS_dup3, [oldfd as u64, newfd as u64, 0, 0, 0, 0])
+            .map(|x| x as i32)
     }
     fn close(&self, fd: i32) -> Result<i32> {
-        self.syscall(SYS_close, [fd as u64, 0, 0, 0, 0, 0]).map(|x| x as i32)
+        self.syscall(SYS_close, [fd as u64, 0, 0, 0, 0, 0])
+            .map(|x| x as i32)
     }
-    fn mmap(&self, addr: usize, length: usize, prot: i32, flags: i32, fd: i32, offset: usize) -> Result<usize> {
-        self.syscall(SYS_mmap, [
-            addr as u64, length as u64, prot as u64, flags as u64, fd as u64, offset as u64
-        ]).map(|x| x as usize)
+    fn mmap(
+        &self,
+        addr: usize,
+        length: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: usize,
+    ) -> Result<usize> {
+        self.syscall(
+            SYS_mmap,
+            [
+                addr as u64,
+                length as u64,
+                prot as u64,
+                flags as u64,
+                fd as u64,
+                offset as u64,
+            ],
+        )
+        .map(|x| x as usize)
     }
     fn munmap(&self, addr: usize, length: usize) -> Result<i32> {
-        self.syscall(SYS_munmap, [
-            addr as u64, length as u64, 0, 0, 0, 0
-        ]).map(|x| x as i32)
+        self.syscall(SYS_munmap, [addr as u64, length as u64, 0, 0, 0, 0])
+            .map(|x| x as i32)
     }
     fn open(&self, path: usize, flags: i32, mode: i32) -> Result<i32> {
-        self.syscall(SYS_openat, [
-            AT_FDCWD as u64, path as u64, flags as u64, mode as u64, 0, 0
-        ]).map(|x| x as i32)
+        self.syscall(
+            SYS_openat,
+            [
+                AT_FDCWD as u64,
+                path as u64,
+                flags as u64,
+                mode as u64,
+                0,
+                0,
+            ],
+        )
+        .map(|x| x as i32)
     }
     fn syscall(&self, syscall_no: c_long, args: [c_ulonglong; 6]) -> Result<c_ulonglong> {
         let mut regs = self.old_regs;
@@ -640,7 +751,7 @@ fn wait_for_group_stop(pid: Pid) -> Result<()> {
                     ptrace::cont(pid, None)?;
                 }
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
     }
 }
@@ -678,7 +789,12 @@ impl Client {
             data: [0u8; CROSS_DOMAIN_SR_TAIL_SIZE],
         };
         let mut ioslice = [IoSliceMut::new(&mut ring_msg.data)];
-        let msg: RecvMsg<()> = recvmsg(self.socket.as_raw_fd(), &mut ioslice, Some(&mut fdspace), MsgFlags::empty())?;
+        let msg: RecvMsg<()> = recvmsg(
+            self.socket.as_raw_fd(),
+            &mut ioslice,
+            Some(&mut fdspace),
+            MsgFlags::empty(),
+        )?;
         let mut fds = Vec::new();
         for cmsg in msg.cmsgs()? {
             match cmsg {
@@ -687,7 +803,7 @@ impl Client {
                         fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
                     }
                 }
-                _ => unimplemented!()
+                _ => unimplemented!(),
             }
         }
         let len = if let Some(iov) = msg.iovs().next() {
@@ -706,7 +822,8 @@ impl Client {
             let mut ptr = self.request_tail;
             while ptr < buf.len() {
                 if buf[ptr] == X11_OPCODE_QUERY_EXTENSION {
-                    let namelen = u16::from_ne_bytes(buf[(ptr + 4)..(ptr + 6)].try_into().unwrap()) as usize;
+                    let namelen =
+                        u16::from_ne_bytes(buf[(ptr + 4)..(ptr + 6)].try_into().unwrap()) as usize;
                     let name = String::from_utf8_lossy(&buf[(ptr + 8)..(ptr + 8 + namelen)]);
                     if name == "DRI3" {
                         self.dri3_qe_resp_seq = Some(self.seq_no);
@@ -723,16 +840,26 @@ impl Client {
                         reply[1] = 1;
                         reply[2] = (self.seq_no & 0xff) as u8;
                         reply[3] = (self.seq_no >> 8) as u8;
-                        let render = File::options().read(true).write(true).open("/dev/dri/renderD128")?;
+                        let render = File::options()
+                            .read(true)
+                            .write(true)
+                            .open("/dev/dri/renderD128")?;
                         let fds = [render.as_raw_fd()];
                         let cmsgs = [ControlMessage::ScmRights(&fds)];
-                        sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(&reply)], &cmsgs, MsgFlags::empty(), None)?;
+                        sendmsg::<()>(
+                            self.socket.as_raw_fd(),
+                            &[IoSlice::new(&reply)],
+                            &cmsgs,
+                            MsgFlags::empty(),
+                            None,
+                        )?;
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFER {
                         let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
                         fd_xids[cur_fd_for_msg] = Some(xid);
                         cur_fd_for_msg += 1;
                     } else if buf[ptr + 1] == DRI3_OPCODE_FENCE_FROM_FD {
-                        let xid = u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
+                        let xid =
+                            u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
                         fd_xids[cur_fd_for_msg] = Some(xid);
                         cur_fd_for_msg += 1;
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFERS {
@@ -750,21 +877,27 @@ impl Client {
                     }
                 } else if Some(buf[ptr]) == self.present_ext_opcode {
                     if buf[ptr + 1] == PRESENT_OPCODE_PRESENT_PIXMAP {
-                        let xid = u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
+                        let xid =
+                            u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
                         let ep = Epoll::new(EpollCreateFlags::empty()).unwrap();
                         let bufs = &self.buffers_for_pixmap[&xid];
                         let mut remaining = bufs.len();
                         for buf in bufs {
-                            ep.add(buf, EpollEvent::new(EpollFlags::EPOLLIN, buf.as_raw_fd() as u64)).unwrap();
+                            ep.add(
+                                buf,
+                                EpollEvent::new(EpollFlags::EPOLLIN, buf.as_raw_fd() as u64),
+                            )
+                            .unwrap();
                         }
                         let mut events = vec![EpollEvent::empty(); remaining];
                         while remaining != 0 {
                             let processed = match ep.wait(&mut events, EpollTimeout::NONE) {
                                 Err(Errno::EINTR) => 0,
-                                e => e.unwrap()
+                                e => e.unwrap(),
                             };
                             for e in &events[0..processed] {
-                                ep.delete(unsafe { BorrowedFd::borrow_raw(e.data() as RawFd) }).unwrap();
+                                ep.delete(unsafe { BorrowedFd::borrow_raw(e.data() as RawFd) })
+                                    .unwrap();
                             }
                             remaining -= processed;
                         }
@@ -777,9 +910,12 @@ impl Client {
                     self.buffers_for_pixmap.remove(&xid);
                 }
                 self.seq_no = self.seq_no.wrapping_add(1);
-                let mut req_len = u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
+                let mut req_len =
+                    u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
                 if req_len == 0 {
-                    req_len = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap()) as usize * 4;
+                    req_len = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap())
+                        as usize
+                        * 4;
                 }
                 ptr += req_len;
             }
@@ -813,15 +949,25 @@ impl Client {
             self.futex_watchers.remove(&xid).unwrap();
             let ft_destroy_msg_size = mem::size_of::<CrossDomainFutexDestroy>();
             let ft_msg = CrossDomainFutexDestroy {
-                hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_DESTROY, ft_destroy_msg_size as u16),
+                hdr: CrossDomainHeader::new(
+                    CROSS_DOMAIN_CMD_FUTEX_DESTROY,
+                    ft_destroy_msg_size as u16,
+                ),
                 id: xid,
                 pad: 0,
             };
-            self.gpu_ctx.submit_cmd(&ft_msg, ft_destroy_msg_size, None, None)?;
+            self.gpu_ctx
+                .submit_cmd(&ft_msg, ft_destroy_msg_size, None, None)?;
         }
         Ok(false)
     }
-    fn vgpu_id_from_prime<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, fd_xids: &[Option<u32>], fd: OwnedFd) -> Result<u32> {
+    fn vgpu_id_from_prime<T>(
+        &mut self,
+        ring_msg: &mut CrossDomainSendReceive<T>,
+        i: usize,
+        fd_xids: &[Option<u32>],
+        fd: OwnedFd,
+    ) -> Result<u32> {
         let mut to_handle = DrmPrimeHandle {
             fd: fd.as_raw_fd(),
             ..DrmPrimeHandle::default()
@@ -829,7 +975,10 @@ impl Client {
         unsafe {
             drm_prime_fd_to_handle(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut to_handle)?;
         }
-        self.buffers_for_pixmap.entry(fd_xids[i].unwrap()).or_default().push(fd);
+        self.buffers_for_pixmap
+            .entry(fd_xids[i].unwrap())
+            .or_default()
+            .push(fd);
         let mut res_info = DrmVirtgpuResourceInfo {
             bo_handle: to_handle.handle,
             ..DrmVirtgpuResourceInfo::default()
@@ -843,7 +992,10 @@ impl Client {
     }
 
     fn replace_futex_storage(my_fd: RawFd, pid: Pid, shmem_path: &str) -> Result<()> {
-        ptrace::seize(pid, Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_EXITKILL)?;
+        ptrace::seize(
+            pid,
+            Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_EXITKILL,
+        )?;
         kill(pid, Signal::SIGSTOP)?;
         wait_for_group_stop(pid)?;
         let my_ino = fstat(my_fd)?.st_ino;
@@ -863,26 +1015,48 @@ impl Client {
                 if fstat(file.as_raw_fd())?.st_ino != my_ino {
                     continue;
                 }
-                let addr = usize::from_str_radix(entry.file_name().to_string_lossy().split('-').next().unwrap(), 16)?;
+                let addr = usize::from_str_radix(
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .split('-')
+                        .next()
+                        .unwrap(),
+                    16,
+                )?;
                 pages_to_replace.push(addr);
             }
         }
         RemoteCaller::with(pid, |caller| {
             let scratch_page = caller.mmap(
-                0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0
+                0,
+                PAGE_SIZE,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
             )?;
             let path_cstr = CString::new(shmem_path).unwrap();
-            process_vm_writev(pid, &[IoSlice::new(path_cstr.as_bytes_with_nul())], &[RemoteIoVec {
-                base: scratch_page,
-                len: path_cstr.len()
-            }])?;
+            process_vm_writev(
+                pid,
+                &[IoSlice::new(path_cstr.as_bytes_with_nul())],
+                &[RemoteIoVec {
+                    base: scratch_page,
+                    len: path_cstr.len(),
+                }],
+            )?;
             let remote_shm = caller.open(scratch_page, O_CLOEXEC | O_RDWR, 0o600)?;
             for fd in fds_to_replace {
                 caller.dup2(remote_shm, fd)?;
             }
             for page in pages_to_replace {
                 caller.mmap(
-                    page, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, remote_shm, 0
+                    page,
+                    PAGE_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED,
+                    remote_shm,
+                    0,
                 )?;
             }
             caller.munmap(scratch_page, PAGE_SIZE)?;
@@ -893,7 +1067,15 @@ impl Client {
         kill(pid, Signal::SIGCONT)?;
         Ok(())
     }
-    fn create_cross_vm_futex<T>(&mut self, ring_msg: &mut CrossDomainSendReceive<T>, i: usize, memfd: OwnedFd, fd_xids: &[Option<u32>], pid: pid_t, filename: Cow<'_, str>) -> Result<()> {
+    fn create_cross_vm_futex<T>(
+        &mut self,
+        ring_msg: &mut CrossDomainSendReceive<T>,
+        i: usize,
+        memfd: OwnedFd,
+        fd_xids: &[Option<u32>],
+        pid: pid_t,
+        filename: Cow<'_, str>,
+    ) -> Result<()> {
         let mut shmem_file;
         let mut shmem_name;
         if filename.starts_with(util::SHM_PREFIX) {
@@ -914,7 +1096,15 @@ impl Client {
             Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
         }
         let addr = FutexPtr(unsafe {
-            mmap(None, 4.try_into().unwrap(), ProtFlags::PROT_WRITE | ProtFlags::PROT_READ, MapFlags::MAP_SHARED, shmem_file, 0)?.as_ptr()
+            mmap(
+                None,
+                4.try_into().unwrap(),
+                ProtFlags::PROT_WRITE | ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                shmem_file,
+                0,
+            )?
+            .as_ptr()
         });
         let ft_new_msg_size = mem::size_of::<CrossDomainFutexNew>();
         let ft_msg = CrossDomainFutexNew {
@@ -923,31 +1113,39 @@ impl Client {
             filename: u64::from_ne_bytes(shmem_name),
             pad: 0,
         };
-        self.gpu_ctx.submit_cmd(&ft_msg, ft_new_msg_size, None, None)?;
+        self.gpu_ctx
+            .submit_cmd(&ft_msg, ft_new_msg_size, None, None)?;
         let sync_xid = fd_xids[i].unwrap();
         let fd = self.gpu_ctx.fd.as_raw_fd() as c_int;
         // TODO: do we need to wait here?
         //thread::sleep(Duration::from_millis(33));
-        self.futex_watchers.insert(sync_xid, FutexWatcherThread::new(fd, sync_xid, addr));
+        self.futex_watchers
+            .insert(sync_xid, FutexWatcherThread::new(fd, sync_xid, addr));
         ring_msg.identifiers[i] = sync_xid;
         ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
         Ok(())
     }
     fn process_vgpu(&mut self) -> Result<()> {
         let mut evt = DrmEvent::default();
-        read(
-            self.gpu_ctx.fd.as_raw_fd(),
-            unsafe {
-                slice::from_raw_parts_mut(&mut evt as *mut DrmEvent as *mut u8, mem::size_of::<DrmEvent>())
-            }
-        )?;
+        read(self.gpu_ctx.fd.as_raw_fd(), unsafe {
+            slice::from_raw_parts_mut(
+                &mut evt as *mut DrmEvent as *mut u8,
+                mem::size_of::<DrmEvent>(),
+            )
+        })?;
         assert_eq!(evt.ty, VIRTGPU_EVENT_FENCE_SIGNALED);
         let cmd = unsafe {
-            (self.gpu_ctx.channel_ring.address as *const CrossDomainHeader).as_ref().unwrap().cmd
+            (self.gpu_ctx.channel_ring.address as *const CrossDomainHeader)
+                .as_ref()
+                .unwrap()
+                .cmd
         };
         assert_eq!(cmd, CROSS_DOMAIN_CMD_RECEIVE);
         let recv = unsafe {
-            (self.gpu_ctx.channel_ring.address as *const CrossDomainSendReceive<[u8; CROSS_DOMAIN_SR_TAIL_SIZE]>).as_ref().unwrap()
+            (self.gpu_ctx.channel_ring.address
+                as *const CrossDomainSendReceive<[u8; CROSS_DOMAIN_SR_TAIL_SIZE]>)
+                .as_ref()
+                .unwrap()
         };
         self.process_receive(recv)?;
         self.gpu_ctx.poll_cmd()
@@ -965,7 +1163,10 @@ impl Client {
                 ..DrmVirtgpuResourceCreateBlob::default()
             };
             unsafe {
-                drm_virtgpu_resource_create_blob(self.gpu_ctx.fd.as_raw_fd() as c_int, &mut create_blob)?;
+                drm_virtgpu_resource_create_blob(
+                    self.gpu_ctx.fd.as_raw_fd() as c_int,
+                    &mut create_blob,
+                )?;
             }
             let mut to_fd = DrmPrimeHandle {
                 handle: create_blob.bo_handle,
@@ -978,9 +1179,7 @@ impl Client {
                 drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close)?;
             }
             raw_fds.push(RawFd::from(to_fd.fd));
-            unsafe {
-                owned_fds.push(OwnedFd::from_raw_fd(raw_fds[i]))
-            }
+            unsafe { owned_fds.push(OwnedFd::from_raw_fd(raw_fds[i])) }
         }
         let data = &recv.data[..(recv.opaque_data_size as usize)];
         self.debug_loop.loop_remote(data);
@@ -1018,7 +1217,13 @@ impl Client {
         } else {
             vec![ControlMessage::ScmRights(&raw_fds)]
         };
-        sendmsg::<()>(self.socket.as_raw_fd(), &[IoSlice::new(data)], &cmsgs, MsgFlags::empty(), None)?;
+        sendmsg::<()>(
+            self.socket.as_raw_fd(),
+            &[IoSlice::new(data)],
+            &cmsgs,
+            MsgFlags::empty(),
+            None,
+        )?;
         Ok(())
     }
 }
@@ -1042,7 +1247,12 @@ fn main() {
     if resgid.real != resgid.effective {
         setegid(resgid.effective).unwrap()
     }
-    epoll.add(&listen_sock, EpollEvent::new(EpollFlags::EPOLLIN, listen_sock.as_raw_fd() as u64)).unwrap();
+    epoll
+        .add(
+            &listen_sock,
+            EpollEvent::new(EpollFlags::EPOLLIN, listen_sock.as_raw_fd() as u64),
+        )
+        .unwrap();
     let mut client_sock = HashMap::<u64, Rc<RefCell<Client>>>::new();
     let mut client_vgpu = HashMap::<u64, Rc<RefCell<Client>>>::new();
     loop {
@@ -1050,26 +1260,48 @@ fn main() {
         match epoll.wait(&mut evts, EpollTimeout::NONE) {
             Err(Errno::EINTR) | Ok(0) => {
                 continue;
-            },
-            Ok(_) => {},
+            }
+            Ok(_) => {}
             e => {
                 e.unwrap();
-            },
+            }
         }
         let fd = evts[0].data();
         if fd == listen_sock.as_raw_fd() as u64 {
             let res = listen_sock.accept();
             if res.is_err() {
-                eprintln!("Failed to accept a connection, error: {:?}", res.unwrap_err());
+                eprintln!(
+                    "Failed to accept a connection, error: {:?}",
+                    res.unwrap_err()
+                );
                 continue;
             }
             let stream = res.unwrap().0;
             stream.set_nonblocking(true).unwrap();
             let client = Rc::new(RefCell::new(Client::new(stream).unwrap()));
             client_sock.insert(client.borrow().socket.as_raw_fd() as u64, client.clone());
-            epoll.add(&client.borrow().socket, EpollEvent::new(EpollFlags::EPOLLIN, client.borrow().socket.as_raw_fd() as u64)).unwrap();
-            client_vgpu.insert(client.borrow().gpu_ctx.fd.as_raw_fd() as u64, client.clone());
-            epoll.add(&client.borrow().gpu_ctx.fd, EpollEvent::new(EpollFlags::EPOLLIN, client.borrow().gpu_ctx.fd.as_raw_fd() as u64)).unwrap();
+            epoll
+                .add(
+                    &client.borrow().socket,
+                    EpollEvent::new(
+                        EpollFlags::EPOLLIN,
+                        client.borrow().socket.as_raw_fd() as u64,
+                    ),
+                )
+                .unwrap();
+            client_vgpu.insert(
+                client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
+                client.clone(),
+            );
+            epoll
+                .add(
+                    &client.borrow().gpu_ctx.fd,
+                    EpollEvent::new(
+                        EpollFlags::EPOLLIN,
+                        client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
+                    ),
+                )
+                .unwrap();
         } else if let Some(client) = client_sock.get_mut(&fd) {
             let res = client.borrow_mut().process_socket();
             let hangup = res.is_err() || *res.as_ref().unwrap();
