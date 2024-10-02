@@ -9,6 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::exit;
 use std::ptr::{NonNull};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
 use nix::libc::{c_int, off_t, c_void, O_RDWR, pid_t, c_ulonglong, user_regs_struct, SYS_dup3, SYS_close, SYS_mmap, SYS_munmap, SYS_openat, AT_FDCWD, PTRACE_EVENT_STOP, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, O_CLOEXEC, MAP_SHARED, MAP_FIXED};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use anyhow::Result;
+use clap::Parser;
 use nix::errno::Errno;
 use nix::fcntl::readlink;
 use nix::unistd::{getresgid, getresuid, Pid, read, setegid, seteuid};
@@ -1023,9 +1025,30 @@ impl Client {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = ":0")]
+    listen_display: String,
+}
+
 fn main() {
+    let args = Args::parse();
+
+    let display = if args.listen_display.starts_with(":") {
+        args.listen_display[1..].parse::<u32>().ok()
+    } else {
+        None
+    };
+
+    let sock_path = if let Some(display) = display {
+        format!("/tmp/.X11-unix/X{}", display)
+    } else {
+        eprintln!("Invalid --listen-display value");
+        exit(1)
+    };
+
     let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
-    let sock_path = "/tmp/.X11-unix/X0";
     _ = fs::remove_file(&sock_path);
     let resuid = getresuid().unwrap();
     let resgid = getresgid().unwrap();

@@ -10,3 +10,4 @@ members =  ["preload", "util", "."]
 nix = { version = "0.29", features = ["event", "socket", "ioctl", "mman", "socket", "uio", "fs", "ptrace", "signal", "user"] }
 anyhow = "1"
 util = { path = "util" }
+clap = { version = "4.5.19", features = ["derive"] }
