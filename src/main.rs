@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use nix::errno::Errno;
 use nix::fcntl::readlink;
 use nix::libc::{
@@ -30,6 +31,7 @@ use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::exit;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1228,9 +1230,31 @@ impl Client {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Name of the person to greet
+    #[arg(short, long, default_value = ":0")]
+    listen_display: String,
+}
+
 fn main() {
+    let args = Args::parse();
+
+    let display = if args.listen_display.starts_with(":") {
+        args.listen_display[1..].parse::<u32>().ok()
+    } else {
+        None
+    };
+
+    let sock_path = if let Some(display) = display {
+        format!("/tmp/.X11-unix/X{}", display)
+    } else {
+        eprintln!("Invalid --listen-display value");
+        exit(1)
+    };
+
     let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
-    let sock_path = "/tmp/.X11-unix/X0";
     _ = fs::remove_file(&sock_path);
     let resuid = getresuid().unwrap();
     let resgid = getresgid().unwrap();
