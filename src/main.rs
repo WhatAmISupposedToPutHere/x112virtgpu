@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_long, CString};
-use std::fs::File;
+use std::fs::{read_to_string, File};
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -988,6 +988,7 @@ impl Client {
         )?;
         kill(pid, Signal::SIGSTOP)?;
         wait_for_group_stop(pid)?;
+        // TODO: match st_dev too to avoid false positives
         let my_ino = fstat(my_fd)?.st_ino;
         let mut fds_to_replace = Vec::new();
         for entry in fs::read_dir(format!("/proc/{}/fd", pid))? {
@@ -999,21 +1000,11 @@ impl Client {
             }
         }
         let mut pages_to_replace = Vec::new();
-        for entry in fs::read_dir(format!("/proc/{}/map_files/", pid))? {
-            let entry = entry?;
-            if let Ok(file) = File::open(&entry.path()) {
-                if fstat(file.as_raw_fd())?.st_ino != my_ino {
-                    continue;
-                }
-                let addr = usize::from_str_radix(
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .split('-')
-                        .next()
-                        .unwrap(),
-                    16,
-                )?;
+        for line in read_to_string(format!("/proc/{}/maps", pid))?.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let ino: u64 = f[4].parse()?;
+            if ino == my_ino {
+                let addr = usize::from_str_radix(f[0].split('-').next().unwrap(), 16)?;
                 pages_to_replace.push(addr);
             }
         }
