@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members =  ["preload", "util", "."]
+members =  ["preload", "util", "wrapper", "."]
 
 [dependencies]
 nix = { version = "0.29", features = ["event", "socket", "ioctl", "mman", "socket", "uio", "fs", "ptrace", "signal", "user"] }
