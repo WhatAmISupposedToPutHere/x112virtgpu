@@ -1,0 +1,13 @@
+[package]
+name = "wrapper"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xshmwrap"
+path = "src/main.rs"
+
+[dependencies]
+nix = { workspace = true }
+seccompiler = "0.4.0"
+
