@@ -5,12 +5,11 @@ use nix::fcntl::readlink;
 use nix::libc::{
     c_int, c_ulonglong, c_void, off_t, pid_t, user_regs_struct, SYS_close, SYS_dup3, SYS_mmap,
     SYS_munmap, SYS_openat, AT_FDCWD, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, O_CLOEXEC,
-    O_RDWR, PROT_READ, PROT_WRITE, PTRACE_EVENT_STOP,
+    O_RDWR, PROT_READ, PROT_WRITE,
 };
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::ptrace;
-use nix::sys::ptrace::Options;
 use nix::sys::signal::Signal;
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::socket::{
@@ -1333,7 +1332,6 @@ fn main() {
                 continue;
             }
             let stream = res.unwrap().0;
-            stream.set_nonblocking(true).unwrap();
             let client = Rc::new(RefCell::new(Client::new(stream).unwrap()));
             client_sock.insert(client.borrow().socket.as_raw_fd() as u64, client.clone());
             epoll
