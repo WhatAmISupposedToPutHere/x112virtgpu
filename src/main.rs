@@ -818,6 +818,7 @@ impl Client {
                             .open("/dev/dri/renderD128")?;
                         let fds = [render.as_raw_fd()];
                         let cmsgs = [ControlMessage::ScmRights(&fds)];
+                        self.socket.set_nonblocking(false).unwrap();
                         sendmsg::<()>(
                             self.socket.as_raw_fd(),
                             &[IoSlice::new(&reply)],
@@ -825,6 +826,7 @@ impl Client {
                             MsgFlags::empty(),
                             None,
                         )?;
+                        self.socket.set_nonblocking(true).unwrap();
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFER {
                         let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
                         fd_xids[cur_fd_for_msg] = Some(xid);
@@ -1180,6 +1182,7 @@ impl Client {
         } else {
             vec![ControlMessage::ScmRights(&raw_fds)]
         };
+        self.socket.set_nonblocking(false).unwrap();
         sendmsg::<()>(
             self.socket.as_raw_fd(),
             &[IoSlice::new(data)],
@@ -1187,6 +1190,8 @@ impl Client {
             MsgFlags::empty(),
             None,
         )?;
+        self.socket.set_nonblocking(true).unwrap();
+
         Ok(())
     }
 }
