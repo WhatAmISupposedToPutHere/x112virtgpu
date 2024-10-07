@@ -11,7 +11,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::ptrace;
 use nix::sys::ptrace::Options;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::Signal;
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::socket::{
     getsockopt, recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg,
@@ -706,24 +706,34 @@ impl RemoteCaller {
     }
 }
 
-fn wait_for_group_stop(pid: Pid) -> Result<()> {
+fn wait_for_stop(pid: Pid) -> Result<()> {
     loop {
         let event = waitpid(pid, Some(WaitPidFlag::__WALL))?;
         match event {
             WaitStatus::Stopped(_, sig) => {
-                ptrace::cont(pid, sig)?;
-            }
-            WaitStatus::PtraceEvent(_, sig, status) => {
-                if status != PTRACE_EVENT_STOP {
-                    unimplemented!();
-                }
                 if sig == Signal::SIGSTOP {
                     return Ok(());
                 } else {
-                    ptrace::cont(pid, None)?;
+                    ptrace::cont(pid, sig)?;
                 }
             }
             _ => unimplemented!(),
+        }
+    }
+}
+
+struct PtracedPid(Pid);
+
+impl PtracedPid {
+    fn pid(&self) -> Pid {
+        self.0
+    }
+}
+
+impl Drop for PtracedPid {
+    fn drop(&mut self) {
+        if ptrace::detach(self.0, None).is_err() {
+            eprintln!("Failed to ptrace::detach({}) (continuing)", self.0);
         }
     }
 }
@@ -963,13 +973,38 @@ impl Client {
         Ok(to_handle.handle)
     }
 
+    fn ptrace_all_threads(pid: Pid) -> Result<Vec<PtracedPid>> {
+        let mut tids = Vec::new();
+        for entry in fs::read_dir(format!("/proc/{}/task", pid))? {
+            let entry = match entry {
+                Err(_) => continue,
+                Ok(a) => a,
+            };
+            let tid = Pid::from_raw(
+                entry
+                    .file_name()
+                    .into_string()
+                    .or(Err(Errno::EIO))?
+                    .parse()?,
+            );
+            if let Err(e) = ptrace::attach(tid) {
+                // This could be a race (thread exited), so keep going
+                // unless this is the top-level PID
+                if tid == pid {
+                    return Err(e.into());
+                }
+                eprintln!("ptrace::attach({}, ...) failed (continuing)", pid);
+                continue;
+            }
+            let ptid = PtracedPid(tid);
+            wait_for_stop(ptid.pid())?;
+            tids.push(ptid);
+        }
+        Ok(tids)
+    }
+
     fn replace_futex_storage(my_fd: RawFd, pid: Pid, shmem_path: &str) -> Result<()> {
-        ptrace::seize(
-            pid,
-            Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_EXITKILL,
-        )?;
-        kill(pid, Signal::SIGSTOP)?;
-        wait_for_group_stop(pid)?;
+        let traced = Self::ptrace_all_threads(pid)?;
         // TODO: match st_dev too to avoid false positives
         let my_ino = fstat(my_fd)?.st_ino;
         let mut fds_to_replace = Vec::new();
@@ -1026,8 +1061,8 @@ impl Client {
             caller.close(remote_shm)?;
             Ok(())
         })?;
-        ptrace::detach(pid, None)?;
-        kill(pid, Signal::SIGCONT)?;
+        // This detaches all the traced threads
+        mem::drop(traced);
         Ok(())
     }
     fn create_cross_vm_futex<T>(
