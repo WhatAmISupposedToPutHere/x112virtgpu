@@ -36,7 +36,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
 use std::{env, fs, mem, ptr, slice, thread};
 
 const PAGE_SIZE: usize = 4096;
@@ -528,7 +527,6 @@ fn extract_opcode_from_qe_resp(data: &[u8], ptr: usize) -> Option<u8> {
 
 struct FutexWatcherThread {
     join_handle: Option<JoinHandle<()>>,
-    join_handle2: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     futex: FutexPtr,
 }
@@ -547,22 +545,8 @@ impl FutexWatcherThread {
     fn new(fd: c_int, xid: u32, futex: FutexPtr) -> FutexWatcherThread {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
-        let shutdown3 = shutdown.clone();
         let futex2 = futex.clone();
-        let futex3 = futex.clone();
         let handle = thread::spawn(move || {
-            let uaddr = futex3;
-            loop {
-                if shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                unsafe {
-                    //wake_futex(uaddr.0, !1);
-                }
-                thread::sleep(Duration::from_millis(33));
-            }
-        });
-        let handle2 = thread::spawn(move || {
             let uaddr = futex2;
             let op = nix::libc::FUTEX_WAIT_BITSET;
             let timeout = ptr::null::<()>();
@@ -570,7 +554,7 @@ impl FutexWatcherThread {
             let val3 = 1u32;
             let atomic_val = unsafe { AtomicU32::from_ptr(uaddr.0 as *mut u32) };
             loop {
-                if shutdown3.load(Ordering::SeqCst) {
+                if shutdown2.load(Ordering::SeqCst) {
                     break;
                 }
                 let val = atomic_val.load(Ordering::SeqCst);
@@ -600,8 +584,13 @@ impl FutexWatcherThread {
         FutexWatcherThread {
             futex,
             join_handle: Some(handle),
-            join_handle2: Some(handle2),
-            shutdown: shutdown2,
+            shutdown,
+        }
+    }
+
+    fn signal(&self) {
+        unsafe {
+            wake_futex(self.futex.0, !1);
         }
     }
 }
@@ -613,7 +602,6 @@ impl Drop for FutexWatcherThread {
             wake_futex(self.futex.0, !0);
         }
         self.join_handle.take().unwrap().join().unwrap();
-        self.join_handle2.take().unwrap().join().unwrap();
     }
 }
 
@@ -1137,14 +1125,28 @@ impl Client {
                 .unwrap()
                 .cmd
         };
-        assert_eq!(cmd, CROSS_DOMAIN_CMD_RECEIVE);
-        let recv = unsafe {
-            (self.gpu_ctx.channel_ring.address
-                as *const CrossDomainSendReceive<[u8; CROSS_DOMAIN_SR_TAIL_SIZE]>)
-                .as_ref()
-                .unwrap()
+        match cmd {
+            CROSS_DOMAIN_CMD_RECEIVE => {
+                let recv = unsafe {
+                    (self.gpu_ctx.channel_ring.address
+                        as *const CrossDomainSendReceive<[u8; CROSS_DOMAIN_SR_TAIL_SIZE]>)
+                        .as_ref()
+                        .unwrap()
+                };
+                self.process_receive(recv)?;
+            }
+            CROSS_DOMAIN_CMD_FUTEX_SIGNAL => {
+                let recv = unsafe {
+                    (self.gpu_ctx.channel_ring.address as *const CrossDomainFutexSignal)
+                        .as_ref()
+                        .unwrap()
+                };
+                self.process_futex_signal(recv)?;
+            }
+            a => {
+                eprintln!("Received unknown cross-domain command {}", a);
+            }
         };
-        self.process_receive(recv)?;
         self.gpu_ctx.poll_cmd()
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
@@ -1221,6 +1223,19 @@ impl Client {
             MsgFlags::empty(),
             None,
         )?;
+        Ok(())
+    }
+    fn process_futex_signal(&mut self, recv: &CrossDomainFutexSignal) -> Result<()> {
+        let watcher = match self.futex_watchers.get(&recv.id) {
+            Some(a) => a,
+            None => {
+                eprintln!("Unknown futex id {}", recv.id);
+                return Ok(());
+            }
+        };
+
+        watcher.signal();
+
         Ok(())
     }
 }
