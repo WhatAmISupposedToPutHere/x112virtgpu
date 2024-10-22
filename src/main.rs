@@ -542,7 +542,7 @@ unsafe fn wake_futex(futex: *mut c_void, val3: u32) {
 }
 
 impl FutexWatcherThread {
-    fn new(fd: c_int, xid: u32, futex: FutexPtr) -> FutexWatcherThread {
+    fn new(fd: c_int, xid: u32, futex: FutexPtr, initial_value: u32) -> FutexWatcherThread {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
         let futex2 = futex.clone();
@@ -552,12 +552,12 @@ impl FutexWatcherThread {
             let timeout = ptr::null::<()>();
             let uaddr2 = ptr::null::<()>();
             let val3 = 1u32;
+            let mut val = initial_value;
             let atomic_val = unsafe { AtomicU32::from_ptr(uaddr.0 as *mut u32) };
             loop {
                 if shutdown2.load(Ordering::SeqCst) {
                     break;
                 }
-                let val = atomic_val.load(Ordering::SeqCst);
                 unsafe {
                     nix::libc::syscall(
                         nix::libc::SYS_futex,
@@ -569,6 +569,7 @@ impl FutexWatcherThread {
                         val3,
                     );
                 }
+                val = atomic_val.load(Ordering::SeqCst);
                 let ft_signal_msg_size = mem::size_of::<CrossDomainFutexSignal>();
                 let ft_signal_cmd = CrossDomainFutexSignal {
                     hdr: CrossDomainHeader::new(
@@ -598,6 +599,9 @@ impl FutexWatcherThread {
 impl Drop for FutexWatcherThread {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        let atomic_val = unsafe { AtomicU32::from_ptr(self.futex.0 as *mut u32) };
+        let v = atomic_val.load(Ordering::SeqCst);
+        atomic_val.store(!v, Ordering::SeqCst);
         unsafe {
             wake_futex(self.futex.0, !0);
         }
@@ -1091,6 +1095,9 @@ impl Client {
             )?
             .as_ptr()
         });
+        let initial_value =
+            unsafe { AtomicU32::from_ptr(addr.0 as *mut u32) }.load(Ordering::Relaxed);
+
         let ft_new_msg_size = mem::size_of::<CrossDomainFutexNew>();
         let ft_msg = CrossDomainFutexNew {
             hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_NEW, ft_new_msg_size as u16),
@@ -1104,8 +1111,10 @@ impl Client {
         let fd = self.gpu_ctx.fd.as_raw_fd() as c_int;
         // TODO: do we need to wait here?
         //thread::sleep(Duration::from_millis(33));
-        self.futex_watchers
-            .insert(sync_xid, FutexWatcherThread::new(fd, sync_xid, addr));
+        self.futex_watchers.insert(
+            sync_xid,
+            FutexWatcherThread::new(fd, sync_xid, addr, initial_value),
+        );
         ring_msg.identifiers[i] = sync_xid;
         ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
         Ok(())
