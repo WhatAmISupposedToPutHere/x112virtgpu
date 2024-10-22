@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::ErrorKind;
 
 pub const SHM_PREFIX: &'static str = "/dev/shm/krshm-";
+pub const SHM_DIR: &'static str = "/dev/shm/";
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
