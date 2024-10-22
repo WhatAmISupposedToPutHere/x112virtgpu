@@ -19,7 +19,7 @@ use nix::sys::stat::fstat;
 use nix::sys::uio::{process_vm_writev, RemoteIoVec};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getresgid, getresuid, read, setegid, seteuid, Pid};
-use nix::{cmsg_space, ioctl_readwrite, ioctl_write_ptr, NixPath};
+use nix::{cmsg_space, ioctl_read, ioctl_readwrite, ioctl_write_ptr, NixPath};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ use std::fs::{read_to_string, File};
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::exit;
 use std::ptr::NonNull;
@@ -66,8 +66,25 @@ const SYNC_OPCODE_DESTROY_FENCE: u8 = 17;
 const DRI3_OPCODE_PIXMAP_FROM_BUFFERS: u8 = 7;
 const PRESENT_OPCODE_PRESENT_PIXMAP: u8 = 1;
 
+#[repr(C)]
+#[derive(Debug, Default)]
+struct ExportedHandle {
+    fs_id: u64,
+    handle: u64,
+}
+
 const SYSCALL_INSTR: u32 = 0xd4000001;
 static SYSCALL_OFFSET: OnceLock<usize> = OnceLock::new();
+
+const VIRTIO_IOC_MAGIC: u8 = b'v';
+const VIRTIO_IOC_TYPE_EXPORT_FD: u8 = 1;
+
+ioctl_read!(
+    virtio_export_handle,
+    VIRTIO_IOC_MAGIC,
+    VIRTIO_IOC_TYPE_EXPORT_FD,
+    ExportedHandle
+);
 
 #[repr(C)]
 #[derive(Default)]
@@ -236,7 +253,8 @@ impl CrossDomainPoll {
 #[repr(C)]
 pub struct CrossDomainFutexNew {
     hdr: CrossDomainHeader,
-    filename: u64,
+    fs_id: u64,
+    handle: u64,
     id: u32,
     pad: u32,
 }
@@ -1043,14 +1061,11 @@ impl Client {
         filename: Cow<'_, str>,
     ) -> Result<()> {
         let mut shmem_file;
-        let mut shmem_name;
-        if filename.starts_with(util::SHM_PREFIX) {
-            shmem_name = [0; 8];
-            for i in 0..8 {
-                shmem_name[i] = filename.as_bytes()[i + util::SHM_PREFIX.len()];
-            }
+        // Allow everything in /dev/shm (including paths with trailing '(deleted)')
+        if filename.starts_with(util::SHM_DIR) {
             shmem_file = File::from(memfd);
         } else {
+            let shmem_name;
             (shmem_name, shmem_file) = util::create_shm_file()?;
             let mut shmem_path = util::SHM_PREFIX.to_owned();
             for c in shmem_name {
@@ -1061,6 +1076,10 @@ impl Client {
             shmem_file.write_all(&data)?;
             Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
         }
+
+        let mut handle: ExportedHandle = Default::default();
+        unsafe { virtio_export_handle(shmem_file.as_raw_fd(), &mut handle) }?;
+
         let addr = FutexPtr(unsafe {
             mmap(
                 None,
@@ -1079,7 +1098,8 @@ impl Client {
         let ft_msg = CrossDomainFutexNew {
             hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_FUTEX_NEW, ft_new_msg_size as u16),
             id: fd_xids[i].unwrap(),
-            filename: u64::from_ne_bytes(shmem_name),
+            fs_id: handle.fs_id,
+            handle: handle.handle,
             pad: 0,
         };
         self.gpu_ctx
