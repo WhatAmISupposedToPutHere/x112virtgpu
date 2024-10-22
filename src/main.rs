@@ -1119,7 +1119,7 @@ impl Client {
         ring_msg.identifier_types[i] = CROSS_DOMAIN_ID_TYPE_SHM;
         Ok(())
     }
-    fn process_vgpu(&mut self) -> Result<()> {
+    fn process_vgpu(&mut self) -> Result<bool> {
         let mut evt = DrmEvent::default();
         read(self.gpu_ctx.fd.as_raw_fd(), unsafe {
             slice::from_raw_parts_mut(
@@ -1142,6 +1142,9 @@ impl Client {
                         .as_ref()
                         .unwrap()
                 };
+                if recv.opaque_data_size == 0 {
+                    return Ok(true);
+                }
                 self.process_receive(recv)?;
             }
             CROSS_DOMAIN_CMD_FUTEX_SIGNAL => {
@@ -1156,7 +1159,8 @@ impl Client {
                 eprintln!("Received unknown cross-domain command {}", a);
             }
         };
-        self.gpu_ctx.poll_cmd()
+        self.gpu_ctx.poll_cmd()?;
+        Ok(false)
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
         let mut raw_fds = Vec::with_capacity(recv.num_identifiers as usize);
@@ -1381,33 +1385,42 @@ fn main() {
                 )
                 .unwrap();
         } else if let Some(client) = client_sock.get_mut(&fd) {
-            let res = client.borrow_mut().process_socket();
-            let hangup = res.is_err() || *res.as_ref().unwrap();
-            if res.is_err() {
-                eprintln!("Client disconnected with error: {:?}", res.unwrap_err());
-            }
-            if hangup {
+            if client
+                .borrow_mut()
+                .process_socket()
+                .map_err(|e| {
+                    eprintln!("Client disconnected with error: {:?}", e);
+                    e
+                })
+                .unwrap_or(true)
+            {
                 let client = client.borrow();
                 let gpu_fd = client.gpu_ctx.fd.as_fd();
                 epoll.delete(gpu_fd).unwrap();
                 epoll.delete(&client.socket).unwrap();
                 let gpu_fd = gpu_fd.as_raw_fd() as u64;
                 drop(client);
-                client_vgpu.remove(&gpu_fd);
-                client_sock.remove(&fd);
+                client_vgpu.remove(&gpu_fd).unwrap();
+                client_sock.remove(&fd).unwrap();
             }
         } else if let Some(client) = client_vgpu.get_mut(&fd) {
-            let res = client.borrow_mut().process_vgpu();
-            if let Err(e) = res {
-                eprintln!("Client disconnected with error: {:?}", e);
+            if client
+                .borrow_mut()
+                .process_vgpu()
+                .map_err(|e| {
+                    eprintln!("Server disconnected with error: {:?}", e);
+                    e
+                })
+                .unwrap_or(true)
+            {
                 let client = client.borrow();
                 let gpu_fd = client.gpu_ctx.fd.as_fd();
                 epoll.delete(gpu_fd).unwrap();
-                let gpu_fd = gpu_fd.as_raw_fd() as u64;
+                let client_fd = client.socket.as_raw_fd() as u64;
                 epoll.delete(&client.socket).unwrap();
                 drop(client);
-                client_vgpu.remove(&gpu_fd);
-                client_sock.remove(&fd);
+                client_vgpu.remove(&fd).unwrap();
+                client_sock.remove(&client_fd).unwrap();
             }
         }
     }
