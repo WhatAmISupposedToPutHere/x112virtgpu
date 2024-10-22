@@ -850,30 +850,7 @@ impl Client {
                     }
                 } else if Some(buf[ptr]) == self.present_ext_opcode {
                     if buf[ptr + 1] == PRESENT_OPCODE_PRESENT_PIXMAP {
-                        let xid =
-                            u32::from_ne_bytes(buf[(ptr + 8)..(ptr + 12)].try_into().unwrap());
-                        let ep = Epoll::new(EpollCreateFlags::empty()).unwrap();
-                        let bufs = &self.buffers_for_pixmap[&xid];
-                        let mut remaining = bufs.len();
-                        for buf in bufs {
-                            ep.add(
-                                buf,
-                                EpollEvent::new(EpollFlags::EPOLLIN, buf.as_raw_fd() as u64),
-                            )
-                            .unwrap();
-                        }
-                        let mut events = vec![EpollEvent::empty(); remaining];
-                        while remaining != 0 {
-                            let processed = match ep.wait(&mut events, EpollTimeout::NONE) {
-                                Err(Errno::EINTR) => 0,
-                                e => e.unwrap(),
-                            };
-                            for e in &events[0..processed] {
-                                ep.delete(unsafe { BorrowedFd::borrow_raw(e.data() as RawFd) })
-                                    .unwrap();
-                            }
-                            remaining -= processed;
-                        }
+                        /* TODO: Implement GPU fence passing here when we have it. */
                     }
                 } else if buf[ptr] == X11_OPCODE_CREATE_PIXMAP {
                     let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
