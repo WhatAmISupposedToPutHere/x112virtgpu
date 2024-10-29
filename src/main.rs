@@ -22,7 +22,7 @@ use nix::unistd::{getresgid, getresuid, read, setegid, seteuid, Pid};
 use nix::{cmsg_space, ioctl_read, ioctl_readwrite, ioctl_write_ptr, NixPath};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_long, CString};
 use std::fs::{read_to_string, File};
 use std::io::{IoSlice, IoSliceMut, Read, Write};
@@ -502,6 +502,11 @@ impl DebugLoop {
     }
 }
 
+struct SendPacket {
+    data: Vec<u8>,
+    fds: Vec<OwnedFd>,
+}
+
 struct Client {
     // futex_watchers must be dropped before gpu_ctx, so it goes first
     futex_watchers: HashMap<u32, FutexWatcherThread>,
@@ -517,9 +522,13 @@ struct Client {
     present_qe_resp_seq: Option<u16>,
     seq_no: u16,
     reply_tail: usize,
+    reply_head: Vec<u8>,
     request_tail: usize,
+    request_head: Vec<u8>,
+    request_fds: Vec<OwnedFd>,
     debug_loop: DebugLoop,
     buffers_for_pixmap: HashMap<u32, Vec<OwnedFd>>,
+    send_queue: VecDeque<SendPacket>,
 }
 
 #[derive(Clone)]
@@ -747,6 +756,14 @@ impl Drop for PtracedPid {
     }
 }
 
+#[derive(Debug)]
+enum ClientEvent {
+    None,
+    StartSend,
+    StopSend,
+    Close,
+}
+
 impl Client {
     fn new(socket: UnixStream) -> Result<Client> {
         Ok(Client {
@@ -761,14 +778,66 @@ impl Client {
             present_ext_opcode: None,
             seq_no: 1,
             reply_tail: 0,
+            reply_head: Vec::new(),
             got_first_resp: false,
             request_tail: 0,
+            request_head: Vec::new(),
+            request_fds: Vec::new(),
             futex_watchers: HashMap::new(),
             debug_loop: DebugLoop::new(),
             buffers_for_pixmap: HashMap::new(),
+            send_queue: VecDeque::new(),
         })
     }
-    fn process_socket(&mut self) -> Result<bool> {
+    fn process_socket(&mut self, events: EpollFlags) -> Result<ClientEvent> {
+        if events.contains(EpollFlags::EPOLLIN) {
+            let queue_empty = self.send_queue.is_empty();
+            if self.process_socket_recv()? {
+                return Ok(ClientEvent::Close);
+            }
+            if queue_empty && !self.send_queue.is_empty() {
+                return Ok(ClientEvent::StartSend);
+            }
+        }
+        if events.contains(EpollFlags::EPOLLOUT) {
+            self.process_socket_send()?;
+            if self.send_queue.is_empty() {
+                return Ok(ClientEvent::StopSend);
+            }
+        }
+        Ok(ClientEvent::None)
+    }
+
+    fn process_socket_send(&mut self) -> Result<()> {
+        let mut msg = self.send_queue.pop_front().unwrap();
+        let fds: Vec<RawFd> = msg.fds.iter().map(|a| a.as_raw_fd()).collect();
+        let cmsgs = if fds.len() == 0 {
+            Vec::new()
+        } else {
+            vec![ControlMessage::ScmRights(&fds)]
+        };
+        match sendmsg::<()>(
+            self.socket.as_raw_fd(),
+            &[IoSlice::new(&msg.data)],
+            &cmsgs,
+            MsgFlags::empty(),
+            None,
+        ) {
+            Ok(sent) => {
+                if sent < msg.data.len() {
+                    msg.data = msg.data.split_off(sent);
+                    self.send_queue.push_front(SendPacket {
+                        data: msg.data.split_off(sent),
+                        fds: Vec::new(),
+                    });
+                }
+            }
+            Err(Errno::EAGAIN) => self.send_queue.push_front(msg),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(())
+    }
+    fn process_socket_recv(&mut self) -> Result<bool> {
         let mut fdspace = cmsg_space!([RawFd; CROSS_DOMAIN_MAX_IDENTIFIERS]);
         let mut ring_msg = CrossDomainSendReceive {
             hdr: CrossDomainHeader::new(CROSS_DOMAIN_CMD_SEND, 0),
@@ -779,19 +848,29 @@ impl Client {
             identifier_sizes: [0; CROSS_DOMAIN_MAX_IDENTIFIERS],
             data: [0u8; CROSS_DOMAIN_SR_TAIL_SIZE],
         };
-        let mut ioslice = [IoSliceMut::new(&mut ring_msg.data)];
+        let recv_buf = if self.request_tail > 0 {
+            assert!(self.request_head.is_empty());
+            assert!(self.request_fds.is_empty());
+            let len = self.request_tail.min(ring_msg.data.len());
+            &mut ring_msg.data[..len]
+        } else {
+            let head_len = self.request_head.len();
+            ring_msg.data[..head_len].copy_from_slice(&self.request_head);
+            self.request_head.clear();
+            &mut ring_msg.data[head_len..]
+        };
+        let mut ioslice = [IoSliceMut::new(recv_buf)];
         let msg: RecvMsg<()> = recvmsg(
             self.socket.as_raw_fd(),
             &mut ioslice,
             Some(&mut fdspace),
             MsgFlags::empty(),
         )?;
-        let mut fds = Vec::new();
         for cmsg in msg.cmsgs()? {
             match cmsg {
                 ControlMessageOwned::ScmRights(rf) => {
                     for fd in rf {
-                        fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                        self.request_fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
                     }
                 }
                 _ => unimplemented!(),
@@ -809,9 +888,37 @@ impl Client {
         let mut fences_to_destroy = Vec::new();
         if !self.got_first_req {
             self.got_first_req = true;
-        } else {
-            let mut ptr = self.request_tail;
+        } else if self.request_tail > 0 {
+            assert!(self.request_fds.is_empty());
+            self.request_tail -= buf.len();
+        } else if self.request_tail == 0 {
+            let mut ptr = 0;
             while ptr < buf.len() {
+                if buf.len() - ptr < 4 {
+                    eprintln!(
+                        "X11 message truncated (expected at least 4 bytes, got {}:{} = {})",
+                        ptr,
+                        buf.len(),
+                        buf.len() - ptr
+                    );
+                    break;
+                }
+                let mut req_len =
+                    u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
+                if req_len == 0 {
+                    if buf.len() - ptr < 8 {
+                        eprintln!(
+                            "X11 message truncated (expected at least 8 bytes, got {}:{} = {})",
+                            ptr,
+                            buf.len(),
+                            buf.len() - ptr
+                        );
+                        break;
+                    }
+                    req_len = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap())
+                        as usize
+                        * 4;
+                }
                 if buf[ptr] == X11_OPCODE_QUERY_EXTENSION {
                     let namelen =
                         u16::from_ne_bytes(buf[(ptr + 4)..(ptr + 6)].try_into().unwrap()) as usize;
@@ -826,24 +933,17 @@ impl Client {
                 } else if Some(buf[ptr]) == self.dri3_ext_opcode {
                     if buf[ptr + 1] == DRI3_OPCODE_OPEN {
                         buf[ptr] = X11_OPCODE_NOP;
-                        let mut reply = [0u8; 32];
-                        reply[0] = 1;
-                        reply[1] = 1;
-                        reply[2] = (self.seq_no & 0xff) as u8;
-                        reply[3] = (self.seq_no >> 8) as u8;
+                        let mut reply =
+                            vec![1, 1, (self.seq_no & 0xff) as u8, (self.seq_no >> 8) as u8];
+                        reply.extend_from_slice(&[0u8; 28]);
                         let render = File::options()
                             .read(true)
                             .write(true)
                             .open("/dev/dri/renderD128")?;
-                        let fds = [render.as_raw_fd()];
-                        let cmsgs = [ControlMessage::ScmRights(&fds)];
-                        sendmsg::<()>(
-                            self.socket.as_raw_fd(),
-                            &[IoSlice::new(&reply)],
-                            &cmsgs,
-                            MsgFlags::empty(),
-                            None,
-                        )?;
+                        self.send_queue.push_back(SendPacket {
+                            data: reply,
+                            fds: vec![render.into()],
+                        });
                     } else if buf[ptr + 1] == DRI3_OPCODE_PIXMAP_FROM_BUFFER {
                         let xid = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap());
                         fd_xids[cur_fd_for_msg] = Some(xid);
@@ -878,23 +978,27 @@ impl Client {
                     self.buffers_for_pixmap.remove(&xid);
                 }
                 self.seq_no = self.seq_no.wrapping_add(1);
-                let mut req_len =
-                    u16::from_ne_bytes(buf[(ptr + 2)..(ptr + 4)].try_into().unwrap()) as usize * 4;
-                if req_len == 0 {
-                    req_len = u32::from_ne_bytes(buf[(ptr + 4)..(ptr + 8)].try_into().unwrap())
-                        as usize
-                        * 4;
-                }
                 ptr += req_len;
             }
-            self.request_tail = ptr - buf.len();
+            if ptr < buf.len() {
+                self.request_head = buf[ptr..].to_vec();
+            } else {
+                self.request_tail = ptr - buf.len();
+            }
         }
-        assert_eq!(cur_fd_for_msg, fds.len());
-        let size = mem::size_of::<CrossDomainSendReceive<()>>() + buf.len();
-        ring_msg.opaque_data_size = buf.len() as u32;
+        if self.request_head.is_empty() {
+            assert_eq!(cur_fd_for_msg, self.request_fds.len());
+        } else {
+            assert_eq!(self.request_tail, 0);
+            assert!(cur_fd_for_msg <= self.request_fds.len());
+        }
+        let send_len = buf.len() - self.request_head.len();
+        let size = mem::size_of::<CrossDomainSendReceive<()>>() + send_len;
+        ring_msg.opaque_data_size = send_len as u32;
         ring_msg.hdr.cmd_size = size as u16;
-        ring_msg.num_identifiers = fds.len() as u32;
-        let mut gem_handles = Vec::with_capacity(fds.len());
+        ring_msg.num_identifiers = cur_fd_for_msg as u32;
+        let mut gem_handles = Vec::with_capacity(cur_fd_for_msg);
+        let fds: Vec<OwnedFd> = self.request_fds.drain(..cur_fd_for_msg).collect();
         for (i, fd) in fds.into_iter().enumerate() {
             let filename = readlink(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str())?;
             let filename = filename.to_string_lossy();
@@ -1160,7 +1264,6 @@ impl Client {
         Ok(false)
     }
     fn process_receive(&mut self, recv: &CrossDomainSendReceive<[u8]>) -> Result<()> {
-        let mut raw_fds = Vec::with_capacity(recv.num_identifiers as usize);
         let mut owned_fds = Vec::with_capacity(recv.num_identifiers as usize);
         for i in 0..recv.num_identifiers as usize {
             assert_eq!(recv.identifier_types[i], CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB);
@@ -1187,8 +1290,7 @@ impl Client {
                 let close = DrmGemClose::new(create_blob.bo_handle);
                 drm_gem_close(self.gpu_ctx.fd.as_raw_fd() as c_int, &close)?;
             }
-            raw_fds.push(RawFd::from(to_fd.fd));
-            unsafe { owned_fds.push(OwnedFd::from_raw_fd(raw_fds[i])) }
+            unsafe { owned_fds.push(OwnedFd::from_raw_fd(to_fd.fd)) }
         }
         let data = &recv.data[..(recv.opaque_data_size as usize)];
         self.debug_loop.loop_remote(data);
@@ -1196,8 +1298,48 @@ impl Client {
             self.got_first_resp = true;
             self.reply_tail = u16::from_ne_bytes(data[6..8].try_into().unwrap()) as usize * 4 + 8;
         }
-        let mut ptr = self.reply_tail;
+        let data = if self.reply_tail > 0 {
+            assert!(self.reply_head.is_empty());
+            let block = self.reply_tail.min(data.len());
+            let (block_data, data) = data.split_at(block);
+            // If we have a reply tail, we need to send it separately. This is to ensure
+            // that no fds are attached to it, since libxcb cannot handle fds not
+            // attached to a packet header.
+            self.send_queue.push_back(SendPacket {
+                data: block_data.into(),
+                fds: Vec::new(),
+            });
+
+            self.reply_tail -= block;
+            data
+        } else {
+            data
+        };
+        assert!(self.reply_tail == 0 || data.is_empty());
+        if data.is_empty() {
+            assert!(owned_fds.is_empty());
+            return Ok(());
+        }
+
+        let data = if self.reply_head.is_empty() {
+            data.to_vec()
+        } else {
+            let mut new_data = core::mem::take(&mut self.reply_head);
+            new_data.extend_from_slice(data);
+            new_data
+        };
+
+        let mut ptr = 0;
         while ptr < data.len() {
+            if data.len() - ptr < 32 {
+                eprintln!(
+                    "X11 message truncated (expected at least 32 bytes, got {}:{} = {})",
+                    ptr,
+                    data.len(),
+                    data.len() - ptr
+                );
+                break;
+            }
             let seq_no = u16::from_ne_bytes(data[(ptr + 2)..(ptr + 4)].try_into().unwrap());
             let is_reply = data[ptr] == X11_REPLY;
             let is_generic = data[ptr] == X11_GENERIC_EVENT;
@@ -1209,30 +1351,29 @@ impl Client {
             if is_reply {
                 if Some(seq_no) == self.dri3_qe_resp_seq {
                     self.dri3_qe_resp_seq = None;
-                    self.dri3_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
+                    self.dri3_ext_opcode = extract_opcode_from_qe_resp(&data, ptr);
                 } else if Some(seq_no) == self.sync_qe_resp_seq {
                     self.sync_qe_resp_seq = None;
-                    self.sync_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
+                    self.sync_ext_opcode = extract_opcode_from_qe_resp(&data, ptr);
                 } else if Some(seq_no) == self.present_qe_resp_seq {
                     self.present_qe_resp_seq = None;
-                    self.present_ext_opcode = extract_opcode_from_qe_resp(data, ptr);
+                    self.present_ext_opcode = extract_opcode_from_qe_resp(&data, ptr);
                 }
             }
             ptr += len;
         }
-        self.reply_tail = ptr - data.len();
-        let cmsgs = if recv.num_identifiers == 0 {
-            Vec::new()
+        let block = if ptr < data.len() {
+            let (block, next_head) = data.split_at(ptr);
+            self.reply_head = next_head.to_vec();
+            block.to_vec()
         } else {
-            vec![ControlMessage::ScmRights(&raw_fds)]
+            self.reply_tail = ptr - data.len();
+            data.to_vec()
         };
-        sendmsg::<()>(
-            self.socket.as_raw_fd(),
-            &[IoSlice::new(data)],
-            &cmsgs,
-            MsgFlags::empty(),
-            None,
-        )?;
+        self.send_queue.push_back(SendPacket {
+            data: block,
+            fds: owned_fds,
+        });
         Ok(())
     }
     fn process_futex_signal(&mut self, recv: &CrossDomainFutexSignal) -> Result<()> {
@@ -1336,88 +1477,125 @@ fn main() {
     let mut client_sock = HashMap::<u64, Rc<RefCell<Client>>>::new();
     let mut client_vgpu = HashMap::<u64, Rc<RefCell<Client>>>::new();
     loop {
-        let mut evts = [EpollEvent::empty()];
-        match epoll.wait(&mut evts, EpollTimeout::NONE) {
-            Err(Errno::EINTR) | Ok(0) => {
-                continue;
-            }
-            Ok(_) => {}
-            e => {
-                e.unwrap();
-            }
-        }
-        let fd = evts[0].data();
-        if fd == listen_sock.as_raw_fd() as u64 {
-            let res = listen_sock.accept();
-            if res.is_err() {
-                eprintln!(
-                    "Failed to accept a connection, error: {:?}",
-                    res.unwrap_err()
+        let mut evts = [EpollEvent::empty(); 16];
+        let count = match epoll.wait(&mut evts, EpollTimeout::NONE) {
+            Err(Errno::EINTR) | Ok(0) => continue,
+            a => a.unwrap(),
+        };
+        for evt in &evts[..count.min(evts.len())] {
+            let fd = evt.data();
+            let events = evt.events();
+            if fd == listen_sock.as_raw_fd() as u64 {
+                let res = listen_sock.accept();
+                if res.is_err() {
+                    eprintln!(
+                        "Failed to accept a connection, error: {:?}",
+                        res.unwrap_err()
+                    );
+                    continue;
+                }
+                let stream = res.unwrap().0;
+                stream.set_nonblocking(true).unwrap();
+                let client = Rc::new(RefCell::new(Client::new(stream).unwrap()));
+                client_sock.insert(client.borrow().socket.as_raw_fd() as u64, client.clone());
+                epoll
+                    .add(
+                        &client.borrow().socket,
+                        EpollEvent::new(
+                            EpollFlags::EPOLLIN,
+                            client.borrow().socket.as_raw_fd() as u64,
+                        ),
+                    )
+                    .unwrap();
+                client_vgpu.insert(
+                    client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
+                    client.clone(),
                 );
-                continue;
-            }
-            let stream = res.unwrap().0;
-            let client = Rc::new(RefCell::new(Client::new(stream).unwrap()));
-            client_sock.insert(client.borrow().socket.as_raw_fd() as u64, client.clone());
-            epoll
-                .add(
-                    &client.borrow().socket,
-                    EpollEvent::new(
-                        EpollFlags::EPOLLIN,
-                        client.borrow().socket.as_raw_fd() as u64,
-                    ),
-                )
-                .unwrap();
-            client_vgpu.insert(
-                client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
-                client.clone(),
-            );
-            epoll
-                .add(
-                    &client.borrow().gpu_ctx.fd,
-                    EpollEvent::new(
-                        EpollFlags::EPOLLIN,
-                        client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
-                    ),
-                )
-                .unwrap();
-        } else if let Some(client) = client_sock.get_mut(&fd) {
-            if client
-                .borrow_mut()
-                .process_socket()
-                .map_err(|e| {
-                    eprintln!("Client disconnected with error: {:?}", e);
-                    e
-                })
-                .unwrap_or(true)
-            {
-                let client = client.borrow();
-                let gpu_fd = client.gpu_ctx.fd.as_fd();
-                epoll.delete(gpu_fd).unwrap();
-                epoll.delete(&client.socket).unwrap();
-                let gpu_fd = gpu_fd.as_raw_fd() as u64;
-                drop(client);
-                client_vgpu.remove(&gpu_fd).unwrap();
-                client_sock.remove(&fd).unwrap();
-            }
-        } else if let Some(client) = client_vgpu.get_mut(&fd) {
-            if client
-                .borrow_mut()
-                .process_vgpu()
-                .map_err(|e| {
-                    eprintln!("Server disconnected with error: {:?}", e);
-                    e
-                })
-                .unwrap_or(true)
-            {
-                let client = client.borrow();
-                let gpu_fd = client.gpu_ctx.fd.as_fd();
-                epoll.delete(gpu_fd).unwrap();
-                let client_fd = client.socket.as_raw_fd() as u64;
-                epoll.delete(&client.socket).unwrap();
-                drop(client);
-                client_vgpu.remove(&fd).unwrap();
-                client_sock.remove(&client_fd).unwrap();
+                epoll
+                    .add(
+                        &client.borrow().gpu_ctx.fd,
+                        EpollEvent::new(
+                            EpollFlags::EPOLLIN,
+                            client.borrow().gpu_ctx.fd.as_raw_fd() as u64,
+                        ),
+                    )
+                    .unwrap();
+            } else if let Some(client) = client_sock.get_mut(&fd) {
+                let event = client
+                    .borrow_mut()
+                    .process_socket(events)
+                    .map_err(|e| {
+                        eprintln!("Client {} disconnected with error: {:?}", fd, e);
+                        e
+                    })
+                    .unwrap_or(ClientEvent::Close);
+                match event {
+                    ClientEvent::None => (),
+                    ClientEvent::StartSend => {
+                        epoll
+                            .modify(
+                                &client.borrow().socket,
+                                &mut EpollEvent::new(
+                                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                                    client.borrow().socket.as_raw_fd() as u64,
+                                ),
+                            )
+                            .unwrap();
+                    }
+                    ClientEvent::StopSend => {
+                        epoll
+                            .modify(
+                                &client.borrow().socket,
+                                &mut EpollEvent::new(
+                                    EpollFlags::EPOLLIN,
+                                    client.borrow().socket.as_raw_fd() as u64,
+                                ),
+                            )
+                            .unwrap();
+                    }
+                    ClientEvent::Close => {
+                        let client = client.borrow();
+                        let gpu_fd = client.gpu_ctx.fd.as_fd();
+                        epoll.delete(gpu_fd).unwrap();
+                        epoll.delete(&client.socket).unwrap();
+                        let gpu_fd = gpu_fd.as_raw_fd() as u64;
+                        drop(client);
+                        client_vgpu.remove(&gpu_fd).unwrap();
+                        client_sock.remove(&fd).unwrap();
+                    }
+                }
+            } else if let Some(client) = client_vgpu.get_mut(&fd) {
+                let queue_empty = client.borrow().send_queue.is_empty();
+                if client
+                    .borrow_mut()
+                    .process_vgpu()
+                    .map_err(|e| {
+                        eprintln!("Server {} disconnected with error: {:?}", fd, e);
+                        e
+                    })
+                    .unwrap_or(true)
+                {
+                    let client = client.borrow();
+                    let gpu_fd = client.gpu_ctx.fd.as_fd();
+                    epoll.delete(gpu_fd).unwrap();
+                    let client_fd = client.socket.as_raw_fd() as u64;
+                    epoll.delete(&client.socket).unwrap();
+                    drop(client);
+                    client_vgpu.remove(&fd).unwrap();
+                    client_sock.remove(&client_fd).unwrap();
+                } else {
+                    if queue_empty && !client.borrow().send_queue.is_empty() {
+                        epoll
+                            .modify(
+                                &client.borrow().socket,
+                                &mut EpollEvent::new(
+                                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                                    client.borrow().socket.as_raw_fd() as u64,
+                                ),
+                            )
+                            .unwrap();
+                    }
+                }
             }
         }
     }
