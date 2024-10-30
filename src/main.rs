@@ -24,7 +24,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_long, CString};
-use std::fs::{read_to_string, File};
+use std::fs::{read_to_string, remove_file, File};
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -1170,7 +1170,7 @@ impl Client {
             shmem_file = File::from(memfd);
         } else {
             let shmem_name;
-            (shmem_name, shmem_file) = util::create_shm_file()?;
+            (shmem_name, shmem_file) = util::create_shm_file(false)?;
             let mut shmem_path = util::SHM_PREFIX.to_owned();
             for c in shmem_name {
                 shmem_path.push(c as char);
@@ -1179,6 +1179,7 @@ impl Client {
             read(memfd.as_raw_fd(), &mut data)?;
             shmem_file.write_all(&data)?;
             Self::replace_futex_storage(memfd.as_raw_fd(), Pid::from_raw(pid), &shmem_path)?;
+            remove_file(&shmem_path)?;
         }
 
         let mut handle: ExportedHandle = Default::default();
